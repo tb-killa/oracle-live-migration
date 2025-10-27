@@ -72,7 +72,7 @@ jobs:
       - name: ⚙️ Installiere Build-Abhängigkeiten
         run: |
           dnf -y install oracle-epel-release-el9
-          dnf -y install wget rsync xorriso zip unzip p7zip p7zip-plugins jq diffutils coreutils util-linux tar
+          dnf -y install git wget rsync xorriso zip unzip p7zip p7zip-plugins jq diffutils coreutils util-linux tar
 
       # 5️⃣ ISO Download & Cache
       - name: 📦 Lade oder prüfe Oracle Linux ISO
