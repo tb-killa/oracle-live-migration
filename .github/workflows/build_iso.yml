@@ -2,10 +2,17 @@ name: Build Oracle Migration Live ISO
 
 on:
   push:
-  workflow_dispatch:
+    branches: [ "main" ]
   schedule:
-    # 🔁 Täglich um 03:00 UTC
-    - cron: "0 3 * * *"
+    - cron: "0 2 * * *"  # täglich um 2 Uhr nachts
+  workflow_dispatch:
+
+env:
+  ISO_URL: "https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso"
+  ISO_NAME: "OracleLinux-R9-U3-x86_64-dvd.iso"
+  ISO_DIR: "migration-live"
+  BUILD_SCRIPT: "build_migration_iso.sh"
+  CACHE_KEY: "oraclelinux9u3-dvd-cache"
 
 jobs:
   build:
@@ -13,98 +20,147 @@ jobs:
     container:
       image: oraclelinux:9
 
-    env:
-      ISO_DIR: migration-live
-      ISO_NAME: OracleLinux-R9-latest-x86_64-dvd.iso
-      ISO_URL: https://yum.oracle.com/ISOS/OracleLinux/OL9/latest/x86_64/OracleLinux-R9-latest-x86_64-dvd.iso
-      BUILD_SCRIPT: build_migration_iso.sh
-
     steps:
-    # ------------------------------------------------------------
-    # 🧩 Repository holen
-    # ------------------------------------------------------------
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      # === 1️⃣ Repository Checkout ===
+      - name: 🧩 Checkout Repository
+        uses: actions/checkout@v4
 
-    # ------------------------------------------------------------
-    # 💾 ISO-CACHE
-    # ------------------------------------------------------------
-    - name: Restore Oracle Linux Base ISO cache
-      id: cache-iso
-      uses: actions/cache@v4
-      with:
-        path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
-        key: oraclelinux9-latest-dvd-cache
+      # === 2️⃣ Struktur- und Berechtigungscheck ===
+      - name: 🔍 Repository Struktur prüfen
+        run: |
+          echo "=== Repository Struktur prüfen ==="
+          find . -maxdepth 3 -type f
 
-    # ------------------------------------------------------------
-    # 📥 ISO laden, wenn nicht im Cache
-    # ------------------------------------------------------------
-    - name: Download Oracle Linux Base ISO (if missing)
-      if: steps.cache-iso.outputs.cache-hit != 'true'
-      run: |
-        set -e
-        mkdir -p $ISO_DIR
-        echo "📦 Lade Oracle Linux 9 Base ISO von:"
-        echo "    $ISO_URL"
-        dnf -y install wget
-        wget --progress=dot:giga -O "$ISO_DIR/$ISO_NAME" "$ISO_URL"
-        echo "✅ Download abgeschlossen."
+          REQUIRED_FILES=(
+            "$BUILD_SCRIPT"
+            "overlay/usr/local/bin/migration-gui.sh"
+            "overlay/root/install-tools.sh"
+            "overlay/etc/systemd/system/migration-autostart.service"
+          )
 
-    # ------------------------------------------------------------
-    # 💾 ISO direkt in Cache schreiben
-    # ------------------------------------------------------------
-    - name: Save Oracle Linux ISO to cache
-      if: steps.cache-iso.outputs.cache-hit != 'true'
-      uses: actions/cache/save@v4
-      with:
-        path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
-        key: oraclelinux9-latest-dvd-cache
+          for f in "${REQUIRED_FILES[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "❌ Fehlende Datei: $f"
+              exit 1
+            else
+              echo "✅ Gefunden: $f"
+            fi
+          done
 
-    # ------------------------------------------------------------
-    # 💾 DNF Cache (optional, schneller)
-    # ------------------------------------------------------------
-    - name: Restore DNF cache
-      id: cache-dnf
-      uses: actions/cache@v4
-      with:
-        path: /var/cache/dnf
-        key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
+          # CRLF-Prüfung
+          if grep -rIUls $'\r' overlay/ >/dev/null 2>&1; then
+            echo "⚠️ CRLF-Zeilenenden gefunden – bitte korrigieren!"
+            exit 1
+          else
+            echo "✅ Keine CRLF-Zeilenenden gefunden."
+          fi
 
-    # ------------------------------------------------------------
-    # 🧰 Dependencies installieren
-    # ------------------------------------------------------------
-    - name: Install build dependencies
-      run: |
-        dnf -y install oracle-epel-release-el9
-        dnf -y install p7zip p7zip-plugins rsync wget xorriso zip unzip tar diffutils coreutils util-linux
+          # Ausführungsrechte prüfen + reparieren
+          for file in "$BUILD_SCRIPT" overlay/usr/local/bin/migration-gui.sh; do
+            if [ ! -x "$file" ]; then
+              echo "⚙️  Repariere Ausführungsrecht: $file"
+              chmod +x "$file"
+            fi
+          done
+          echo "✅ Alle erforderlichen Dateien ausführbar."
 
-    # ------------------------------------------------------------
-    # 🧩 Preflight-Check
-    # ------------------------------------------------------------
-    - name: Preflight checks
-      run: |
-        echo "=== Repository Struktur prüfen ==="
-        test -f "$BUILD_SCRIPT" || (echo "❌ Fehlendes Build-Script!" && exit 1)
-        test -d overlay || (echo "❌ Overlay-Ordner fehlt!" && exit 1)
-        chmod +x "$BUILD_SCRIPT"
-        echo "✅ Struktur ok – Build kann starten."
+      # === 3️⃣ ISO Cache prüfen ===
+      - name: 🗃️ Lade ISO Cache
+        id: cache_iso
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
+          key: ${{ env.CACHE_KEY }}
 
-    # ------------------------------------------------------------
-    # 🚀 ISO-Build ausführen
-    # ------------------------------------------------------------
-    - name: Build Oracle Migration ISO
-      run: |
-        echo "🚀 Starte ISO-Build..."
-        export ISO_SRC="$ISO_DIR/$ISO_NAME"
-        ./build_migration_iso.sh
+      - name: 🗃️ DNF Cache
+        uses: actions/cache@v4
+        with:
+          path: /var/cache/dnf
+          key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
+          restore-keys: |
+            dnf-cache-${{ runner.os }}-
 
-    # ------------------------------------------------------------
-    # 📦 Artefakte hochladen
-    # ------------------------------------------------------------
-    - name: Upload build artifacts
-      uses: actions/upload-artifact@v4
-      with:
-        name: oracle-migration-live-base
-        path: |
-          migration-live/oracle-migration-live.iso
-          migration-live/build.log
+      # === 4️⃣ Abhängigkeiten installieren ===
+      - name: ⚙️ Installiere Build-Abhängigkeiten
+        run: |
+          dnf -y install oracle-epel-release-el9
+          dnf -y install wget rsync xorriso zip unzip p7zip p7zip-plugins jq diffutils coreutils util-linux tar sha256sum
+
+      # === 5️⃣ ISO Download + Verifikation ===
+      - name: 📦 Lade oder prüfe Oracle Linux ISO
+        run: |
+          set -e
+          mkdir -p $ISO_DIR
+          ISO_PATH="$ISO_DIR/$ISO_NAME"
+
+          if [ -f "$ISO_PATH" ]; then
+            echo "✅ ISO bereits im Cache: $ISO_PATH"
+          else
+            echo "📦 Lade ISO von $ISO_URL ..."
+            wget --progress=dot:giga -O "$ISO_PATH" "$ISO_URL"
+            echo "✅ Download abgeschlossen."
+          fi
+
+          echo "🔍 Prüfe Datei-Infos:"
+          ls -lh "$ISO_PATH"
+
+          echo "🔢 Berechne SHA256-Checksumme:"
+          sha256sum "$ISO_PATH" | tee iso_checksum.txt
+
+          # Prüfe ob die Datei >1GB ist (Schnellprüfung gegen defekte Downloads)
+          FILESIZE=$(stat -c%s "$ISO_PATH")
+          if [ "$FILESIZE" -lt 1000000000 ]; then
+            echo "❌ ISO-Datei scheint beschädigt oder unvollständig!"
+            exit 1
+          fi
+
+          echo "✅ ISO-Download erfolgreich validiert."
+
+      # === 6️⃣ Build durchführen ===
+      - name: 🚀 Starte ISO-Build
+        run: |
+          echo "🚀 Starte ISO-Build..."
+          bash "$BUILD_SCRIPT"
+
+      # === 7️⃣ Teste ISO-Ergebnis ===
+      - name: 🧪 Teste erzeugte ISO
+        run: |
+          echo "🧪 Prüfe erzeugte ISO..."
+          ls -lh migration-live/*.iso || { echo "❌ Keine ISO erzeugt!"; exit 1; }
+          ISO_FILE=$(ls migration-live/*.iso | head -n1)
+          echo "✅ ISO gefunden: $ISO_FILE"
+          echo "🔍 Teste Inhaltsverzeichnis:"
+          xorriso -indev "$ISO_FILE" -toc | head -n 25
+
+      # === 8️⃣ Changelog generieren ===
+      - name: 📝 Erzeuge Changelog
+        run: |
+          echo "🧾 Erzeuge Changelog..."
+          mkdir -p changelog
+          {
+            echo "## Build vom $(date -u '+%Y-%m-%d %H:%M UTC')"
+            echo
+            echo "### Git Änderungen:"
+            git log -1 --pretty=format:"- %h %s (%an)"
+            echo
+            echo "### ISO Prüfsumme:"
+            cat iso_checksum.txt
+            echo
+            echo "### Paketliste (Top 40):"
+            rpm -qa --qf "%{NAME}-%{VERSION}\n" | sort | head -n 40
+          } > changelog/latest.md
+          cat changelog/latest.md
+
+      # === 9️⃣ Release veröffentlichen ===
+      - name: 📤 Lade ISO in GitHub Releases hoch
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly-${{ github.run_number }}
+          name: "Oracle Migration ISO Nightly Build #${{ github.run_number }}"
+          body_path: changelog/latest.md
+          files: |
+            migration-live/*.iso
+            iso_checksum.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
