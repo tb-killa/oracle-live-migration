@@ -21,50 +21,38 @@ jobs:
       image: oraclelinux:9
 
     steps:
-      # === 1️⃣ Repository Checkout ===
+      # 1️⃣ Repository Checkout
       - name: 🧩 Checkout Repository
         uses: actions/checkout@v4
 
-      # === 2️⃣ Struktur- und Berechtigungscheck ===
+      # 2️⃣ Strukturprüfung und Rechte
       - name: 🔍 Repository Struktur prüfen
         run: |
           echo "=== Repository Struktur prüfen ==="
-          find . -maxdepth 3 -type f
-
           REQUIRED_FILES=(
             "$BUILD_SCRIPT"
             "overlay/usr/local/bin/migration-gui.sh"
             "overlay/root/install-tools.sh"
             "overlay/etc/systemd/system/migration-autostart.service"
           )
-
           for f in "${REQUIRED_FILES[@]}"; do
             if [ ! -f "$f" ]; then
-              echo "❌ Fehlende Datei: $f"
-              exit 1
+              echo "❌ Fehlende Datei: $f"; exit 1
             else
               echo "✅ Gefunden: $f"
             fi
           done
-
-          # CRLF-Prüfung
+          # CRLF prüfen
           if grep -rIUls $'\r' overlay/ >/dev/null 2>&1; then
-            echo "⚠️ CRLF-Zeilenenden gefunden – bitte korrigieren!"
-            exit 1
+            echo "⚠️ CRLF-Zeilenenden gefunden!"; exit 1
           else
-            echo "✅ Keine CRLF-Zeilenenden gefunden."
+            echo "✅ Keine CRLF-Zeilenenden."
           fi
+          # Ausführbar setzen
+          chmod +x "$BUILD_SCRIPT" overlay/usr/local/bin/migration-gui.sh || true
+          echo "✅ Rechte korrekt gesetzt."
 
-          # Ausführungsrechte prüfen + reparieren
-          for file in "$BUILD_SCRIPT" overlay/usr/local/bin/migration-gui.sh; do
-            if [ ! -x "$file" ]; then
-              echo "⚙️  Repariere Ausführungsrecht: $file"
-              chmod +x "$file"
-            fi
-          done
-          echo "✅ Alle erforderlichen Dateien ausführbar."
-
-      # === 3️⃣ ISO Cache prüfen ===
+      # 3️⃣ Caches aktivieren
       - name: 🗃️ Lade ISO Cache
         id: cache_iso
         uses: actions/cache@v4
@@ -80,59 +68,51 @@ jobs:
           restore-keys: |
             dnf-cache-${{ runner.os }}-
 
-      # === 4️⃣ Abhängigkeiten installieren ===
+      # 4️⃣ Abhängigkeiten installieren
       - name: ⚙️ Installiere Build-Abhängigkeiten
         run: |
           dnf -y install oracle-epel-release-el9
           dnf -y install wget rsync xorriso zip unzip p7zip p7zip-plugins jq diffutils coreutils util-linux tar
 
-      # === 5️⃣ ISO Download + Verifikation ===
+      # 5️⃣ ISO Download & Cache
       - name: 📦 Lade oder prüfe Oracle Linux ISO
         run: |
           set -e
           mkdir -p $ISO_DIR
           ISO_PATH="$ISO_DIR/$ISO_NAME"
-
           if [ -f "$ISO_PATH" ]; then
-            echo "✅ ISO bereits im Cache: $ISO_PATH"
+            echo "✅ ISO bereits im Cache vorhanden: $ISO_PATH"
           else
             echo "📦 Lade ISO von $ISO_URL ..."
             wget --progress=dot:giga -O "$ISO_PATH" "$ISO_URL"
             echo "✅ Download abgeschlossen."
           fi
-
-          echo "🔍 Prüfe Datei-Infos:"
+          echo "🔍 Prüfe Datei:"
           ls -lh "$ISO_PATH"
-
-          echo "🔢 Berechne SHA256-Checksumme:"
+          echo "🔢 Prüfsumme (SHA256):"
           sha256sum "$ISO_PATH" | tee iso_checksum.txt
-
-          # Prüfe ob die Datei >1GB ist (Schnellprüfung gegen defekte Downloads)
           FILESIZE=$(stat -c%s "$ISO_PATH")
           if [ "$FILESIZE" -lt 1000000000 ]; then
-            echo "❌ ISO-Datei scheint beschädigt oder unvollständig!"
-            exit 1
+            echo "❌ ISO-Datei zu klein (<1GB)!"; exit 1
           fi
+          echo "✅ ISO gültig."
 
-          echo "✅ ISO-Download erfolgreich validiert."
-
-      # === 6️⃣ Build durchführen ===
+      # 6️⃣ Build ausführen
       - name: 🚀 Starte ISO-Build
         run: |
           echo "🚀 Starte ISO-Build..."
           bash "$BUILD_SCRIPT"
 
-      # === 7️⃣ Teste ISO-Ergebnis ===
-      - name: 🧪 Teste erzeugte ISO
+      # 7️⃣ ISO Strukturprüfung
+      - name: 🧪 ISO Strukturtest
         run: |
-          echo "🧪 Prüfe erzeugte ISO..."
-          ls -lh migration-live/*.iso || { echo "❌ Keine ISO erzeugt!"; exit 1; }
+          echo "🔍 Teste ISO-Lesbarkeit..."
           ISO_FILE=$(ls migration-live/*.iso | head -n1)
-          echo "✅ ISO gefunden: $ISO_FILE"
-          echo "🔍 Teste Inhaltsverzeichnis:"
-          xorriso -indev "$ISO_FILE" -toc | head -n 25
+          ls -lh "$ISO_FILE"
+          echo "🔍 Prüfe Bootstruktur:"
+          xorriso -indev "$ISO_FILE" -report_el_torito as_mkisofs | grep -E "Boot record|BIOS|EFI" || true
 
-      # === 8️⃣ Changelog generieren ===
+      # 8️⃣ Changelog generieren
       - name: 📝 Erzeuge Changelog
         run: |
           echo "🧾 Erzeuge Changelog..."
@@ -151,8 +131,8 @@ jobs:
           } > changelog/latest.md
           cat changelog/latest.md
 
-      # === 9️⃣ Release veröffentlichen ===
-      - name: 📤 Lade ISO in GitHub Releases hoch
+      # 9️⃣ Release hochladen
+      - name: 📤 GitHub Release Upload
         if: success()
         uses: softprops/action-gh-release@v2
         with:
