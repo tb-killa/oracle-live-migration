@@ -1,9 +1,6 @@
 #!/bin/bash
 # ===============================================================
-#  Oracle Linux Migration Live ISO Builder
-#  - Läuft sowohl lokal als auch im GitHub Actions Container
-#  - Erkennt automatisch verfügbares ISO-Erzeugungs-Tool
-#  - Kein sudo erforderlich
+#  Oracle Linux Migration Live ISO Builder (UEFI + Legacy BIOS)
 # ===============================================================
 set -euo pipefail
 
@@ -12,10 +9,10 @@ ISO_SRC="$WORKDIR/OracleLinux-R9-U3-x86_64-dvd.iso"
 ISO_OUT="$WORKDIR/oracle-migration-live.iso"
 OVERLAY="$(pwd)/overlay"
 
-echo "=== Building Oracle Migration Live ISO ==="
+echo "=== Building Oracle Migration Live ISO (UEFI + BIOS) ==="
 mkdir -p "$WORKDIR/custom_iso" "$WORKDIR/mnt"
 
-# Root/Sudo-Kompatibilität
+# Helper: run mit/ohne sudo
 run() {
   if command -v sudo >/dev/null 2>&1; then
     sudo "$@"
@@ -25,7 +22,7 @@ run() {
 }
 
 # ---------------------------------------------------------------
-# Paketstände protokollieren (für späteren Changelog)
+# Paketliste (für Changelog)
 # ---------------------------------------------------------------
 {
   echo "=== Paketliste $(date -u) UTC ==="
@@ -37,44 +34,70 @@ run() {
 } > "$WORKDIR/new_pkgs.txt"
 
 # ---------------------------------------------------------------
-# ISO mounten (oder Dummy verwenden)
+# Oracle ISO mounten
 # ---------------------------------------------------------------
 echo ">>> Mount ISO: $ISO_SRC"
 if ! run mount -o loop "$ISO_SRC" "$WORKDIR/mnt" 2>/dev/null; then
-  echo "⚠️ Mount fehlgeschlagen, lege Dummy-Struktur an..."
-  mkdir -p "$WORKDIR/mnt"
-fi
-
-rsync -a "$WORKDIR/mnt/" "$WORKDIR/custom_iso/" || true
-run umount "$WORKDIR/mnt" 2>/dev/null || true
-
-# ---------------------------------------------------------------
-# Overlay einspielen
-# ---------------------------------------------------------------
-echo ">>> Kopiere Overlay-Dateien..."
-rsync -a "$OVERLAY/" "$WORKDIR/custom_iso/"
-
-# ---------------------------------------------------------------
-# ISO-Erzeugungstool erkennen
-# ---------------------------------------------------------------
-echo ">>> Erzeuge ISO-Image..."
-if command -v genisoimage >/dev/null 2>&1; then
-  ISO_CMD="genisoimage"
-elif command -v mkisofs >/dev/null 2>&1; then
-  ISO_CMD="mkisofs"
-elif command -v xorriso >/dev/null 2>&1; then
-  ISO_CMD="xorriso -as mkisofs"
-else
-  echo "❌ Kein ISO-Erzeugungstool gefunden (genisoimage/mkisofs/xorriso)"
+  echo "❌ Konnte Oracle ISO nicht mounten. Abbruch."
   exit 1
 fi
 
 # ---------------------------------------------------------------
-# ISO erzeugen
+# Inhalte kopieren + Bootdateien prüfen
 # ---------------------------------------------------------------
-$ISO_CMD -R -J -T -V "Oracle Migration Live" \
-  -b isolinux/isolinux.bin -c isolinux/boot.cat \
-  -no-emul-boot -boot-load-size 4 -boot-info-table \
-  -o "$ISO_OUT" "$WORKDIR/custom_iso"
+echo ">>> Kopiere Originaldateien..."
+rsync -a "$WORKDIR/mnt/" "$WORKDIR/custom_iso/"
 
-echo "✅ ISO erfolgreich erstellt: $ISO_OUT"
+# Legacy BIOS-Dateien prüfen
+if [ ! -f "$WORKDIR/custom_iso/isolinux/isolinux.bin" ]; then
+  echo "❌ isolinux/isolinux.bin fehlt – Legacy Boot nicht möglich!"
+  exit 1
+fi
+if [ ! -f "$WORKDIR/custom_iso/isolinux/boot.cat" ]; then
+  echo "❌ isolinux/boot.cat fehlt – Legacy Boot nicht möglich!"
+  exit 1
+fi
+
+# UEFI-Bootdatei prüfen
+if [ ! -f "$WORKDIR/custom_iso/images/efiboot.img" ]; then
+  echo "❌ images/efiboot.img fehlt – UEFI Boot nicht möglich!"
+  exit 1
+fi
+
+run umount "$WORKDIR/mnt" 2>/dev/null || true
+
+# ---------------------------------------------------------------
+# Overlay anwenden (unsere Migration-GUI etc.)
+# ---------------------------------------------------------------
+echo ">>> Wende Overlay an..."
+rsync -a "$OVERLAY/" "$WORKDIR/custom_iso/"
+
+# ---------------------------------------------------------------
+# ISO-Erzeugungstool bestimmen
+# ---------------------------------------------------------------
+if command -v mkisofs >/dev/null 2>&1; then
+  ISO_CMD="mkisofs"
+elif command -v xorriso >/dev/null 2>&1; then
+  ISO_CMD="xorriso -as mkisofs"
+else
+  echo "❌ Kein ISO-Erzeugungstool gefunden."
+  exit 1
+fi
+
+# ---------------------------------------------------------------
+# Bootfähiges Hybrid-ISO (UEFI + BIOS)
+# ---------------------------------------------------------------
+echo ">>> Erzeuge bootfähiges Hybrid-ISO (UEFI + Legacy BIOS)..."
+$ISO_CMD -R -J -T -V "Oracle_Migration_Live" \
+  -o "$ISO_OUT" "$WORKDIR/custom_iso" \
+  -b isolinux/isolinux.bin \
+  -c isolinux/boot.cat \
+  -no-emul-boot \
+  -boot-load-size 4 \
+  -boot-info-table \
+  -eltorito-alt-boot \
+  -e images/efiboot.img \
+  -no-emul-boot \
+  -isohybrid-gpt-basdat
+
+echo "✅ Bootfähiges Hybrid-ISO erfolgreich erstellt: $ISO_OUT"
