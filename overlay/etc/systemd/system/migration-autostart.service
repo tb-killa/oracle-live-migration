@@ -1,0 +1,15 @@
+[Unit]
+Description=Startet das Oracle OLVM Migration Tool automatisch beim Booten
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/migration-gui.sh
+TTYPath=/dev/tty1
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
