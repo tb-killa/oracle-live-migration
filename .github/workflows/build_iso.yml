@@ -122,7 +122,7 @@ jobs:
         run: |
           dnf -y install oracle-epel-release-el9
           dnf -y update
-          dnf -y install xorriso mkisofs rsync wget p7zip diffutils coreutils util-linux zip tar
+          dnf -y install p7zip p7zip-plugins rsync wget xorriso mkisofs diffutils coreutils util-linux zip tar
 
       # --- ISO Build ---
       - name: Build ISO
