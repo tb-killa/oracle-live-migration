@@ -68,7 +68,7 @@ jobs:
           dnf -y install wget
           echo "📦 Lade Oracle Linux 9 ISO (ca. 9 GB) – bitte Geduld..."
           wget -q --show-progress -O migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
-            https://mirrorservice.org/sites/repo.oracle.com/ol/9/ISO-OL9-u3-x86_64-dvd.iso
+            https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso
           echo "✅ Download abgeschlossen."
 
       # ----------------------------------------------------------
