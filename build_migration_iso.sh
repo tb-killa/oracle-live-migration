@@ -1,129 +1,127 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ===============================================================
-#  Oracle Linux Migration Live ISO Builder
-#  (Dual Boot: UEFI + BIOS, CI-kompatibel ohne Mount)
+#  Oracle Migration Live ISO Build Script
+#  Erstellt ein kompaktes, bootfähiges Oracle Linux 9 Live-Image
 # ===============================================================
-set -euo pipefail
 
+set -euo pipefail
+IFS=$'\n\t'
+
+# --- Pfade -----------------------------------------------------
 WORKDIR="$(pwd)/migration-live"
 ISO_SRC="$WORKDIR/OracleLinux-R9-U3-x86_64-dvd.iso"
 ISO_OUT="$WORKDIR/oracle-migration-live.iso"
 OVERLAY="$(pwd)/overlay"
+EXTRACT="$WORKDIR/custom_iso"
+LOGFILE="$WORKDIR/build.log"
 
 echo "=== Building Oracle Migration Live ISO (UEFI + BIOS) ==="
-mkdir -p "$WORKDIR/custom_iso"
+mkdir -p "$EXTRACT"
 
-# ---------------------------------------------------------------
-# Root/Sudo-kompatible Helper-Funktion
-# ---------------------------------------------------------------
+# --- Helper ----------------------------------------------------
 run() {
-  if command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
-  else
-    "$@"
-  fi
+    echo "+ $*" >> "$LOGFILE"
+    "$@" >> "$LOGFILE" 2>&1
 }
 
-# ---------------------------------------------------------------
-# Paketliste für Changelog
-# ---------------------------------------------------------------
-{
-  echo "=== Paketliste $(date -u) UTC ==="
-  if command -v dnf >/dev/null 2>&1; then
-    run dnf clean all || true
-    run dnf -y update || true
-  fi
-  rpm -qa --qf "%{NAME}-%{VERSION}-%{RELEASE}\n" | sort
-} > "$WORKDIR/new_pkgs.txt"
+# --- Paketliste protokollieren --------------------------------
+echo "=== Paketliste $(date -u) UTC ===" > "$LOGFILE"
+run dnf clean all || true
+run dnf -y update || true
+rpm -qa --qf '%{NAME}-%{VERSION}-%{RELEASE}\n' | sort >> "$LOGFILE"
 
-# ---------------------------------------------------------------
-# ISO extrahieren (xorriso-kompatibel, kein Mount nötig)
-# ---------------------------------------------------------------
-echo ">>> Extrahiere ISO-Inhalt..."
-cd "$WORKDIR"
-
-if command -v xorriso >/dev/null 2>&1; then
-  echo ">>> Verwende xorriso für Extraktion (UDF-kompatibel)..."
-  xorriso -osirrox on -indev "$ISO_SRC" -extract / "$WORKDIR/custom_iso"
-elif command -v bsdtar >/dev/null 2>&1; then
-  echo ">>> Fallback: Verwende bsdtar..."
-  bsdtar -xf "$ISO_SRC" -C "$WORKDIR/custom_iso"
-elif command -v 7z >/dev/null 2>&1; then
-  echo ">>> Letzter Versuch: Verwende 7z..."
-  7z x -y -o"$WORKDIR/custom_iso" "$ISO_SRC"
-elif command -v 7za >/dev/null 2>&1; then
-  echo ">>> Letzter Versuch: Verwende 7za..."
-  7za x -y -o"$WORKDIR/custom_iso" "$ISO_SRC"
-else
-  echo "❌ Kein Entpackwerkzeug (xorriso, bsdtar, 7z/7za) gefunden!"
-  exit 1
+# --- ISO-Existenz prüfen --------------------------------------
+if [ ! -f "$ISO_SRC" ]; then
+    echo "❌ ISO nicht gefunden: $ISO_SRC"
+    echo "Bitte vorher heruntergeladen oder gecached bereitstellen."
+    exit 1
 fi
 
-# ---------------------------------------------------------------
-# Testausgabe – zeige extrahierte Hauptverzeichnisse
-# ---------------------------------------------------------------
+# --- Extraktion ------------------------------------------------
+echo ">>> Extrahiere ISO-Inhalt..."
+run command -v xorriso
+echo ">>> Verwende xorriso für Extraktion (UDF-kompatibel)..."
+run xorriso -osirrox on -indev "$ISO_SRC" -extract / "$EXTRACT"
+
+# --- Testausgabe -----------------------------------------------
 echo ">>> Testausgabe: Beispielhafte Inhalte aus dem ISO:"
-ls -l "$WORKDIR/custom_iso" | head -n 15 || true
-ls -l "$WORKDIR/custom_iso/isolinux" 2>/dev/null | head -n 5 || true
-ls -l "$WORKDIR/custom_iso/images" 2>/dev/null | head -n 5 || true
+ls -l "$EXTRACT" | head -n 20
 echo "---------------------------------------------------------------"
 
-cd - >/dev/null
-
-# ---------------------------------------------------------------
-# Bootdateien prüfen
-# ---------------------------------------------------------------
+# --- Bootdateien prüfen ----------------------------------------
 echo ">>> Prüfe Bootdateien..."
-missing=0
-for file in \
-  "$WORKDIR/custom_iso/isolinux/isolinux.bin" \
-  "$WORKDIR/custom_iso/isolinux/boot.cat" \
-  "$WORKDIR/custom_iso/images/efiboot.img"; do
-  if [ ! -f "$file" ]; then
-    echo "❌ Fehlende Bootdatei: $file"
-    missing=1
-  else
-    echo "✅ Gefunden: ${file##*/}"
-  fi
+MISSING=0
+for file in "$EXTRACT/isolinux/isolinux.bin" \
+             "$EXTRACT/isolinux/boot.cat" \
+             "$EXTRACT/images/efiboot.img"; do
+    if [ ! -f "$file" ]; then
+        echo "❌ Fehlende Bootdatei: $file"
+        MISSING=1
+    else
+        echo "✅ Gefunden: $(basename "$file")"
+    fi
 done
-
-if [ $missing -ne 0 ]; then
-  echo "❌ Mindestens eine Bootdatei fehlt – Build abgebrochen!"
-  exit 1
+if [ "$MISSING" -ne 0 ]; then
+    echo "❌ Mindestens eine Bootdatei fehlt – Abbruch!"
+    exit 1
 fi
 
-# ---------------------------------------------------------------
-# Overlay anwenden (Migration-GUI, Tools, Services etc.)
-# ---------------------------------------------------------------
+# --- Bereinigung unnötiger Inhalte ------------------------------
+echo ">>> Bereinige ISO-Inhalt für Minimal-Variante..."
+# Entferne AppStream, Debug- und Source-Pakete
+rm -rf "$EXTRACT/AppStream" || true
+find "$EXTRACT" -type f -name "*-debuginfo*.rpm" -delete || true
+find "$EXTRACT" -type f -name "*-source*.rpm" -delete || true
+
+# Entferne DNF-Übersetzungen und Metadaten
+rm -rf "$EXTRACT"/repodata/*translation* "$EXTRACT"/repodata/*.gz || true
+
+# Entferne Dokumente, EULA, Logos
+rm -f "$EXTRACT"/{EULA,GPL,OL*-RELNOTES*.zip} || true
+
+# Entferne große Firmware-Pakete (optional)
+find "$EXTRACT" -type f -name "iwlwifi-*.ucode" -delete || true
+find "$EXTRACT" -type f -name "*.bin" -path "*/amdgpu/*" -delete || true
+
+# Entferne Installations-Hilfsdateien
+rm -f "$EXTRACT/isolinux"/{boot.msg,vesamenu.c32,splash.png} || true
+
+# Entferne unnötige Baumdateien
+rm -f "$EXTRACT"/{.discinfo,.treeinfo,extra_files.json,media.repo} || true
+
+echo ">>> Nach Bereinigung beträgt die Größe:"
+du -sh "$EXTRACT" || true
+
+# --- Overlay anwenden ------------------------------------------
 echo ">>> Wende Overlay an..."
-rsync -a "$OVERLAY/" "$WORKDIR/custom_iso/"
-
-# ---------------------------------------------------------------
-# ISO-Erzeugungstool bestimmen
-# ---------------------------------------------------------------
-if command -v mkisofs >/dev/null 2>&1; then
-  ISO_CMD="mkisofs"
-elif command -v xorriso >/dev/null 2>&1; then
-  ISO_CMD="xorriso -as mkisofs"
+if [ -d "$OVERLAY" ]; then
+    rsync -a --exclude='.gitkeep' "$OVERLAY"/ "$EXTRACT"/
 else
-  echo "❌ Kein ISO-Erzeugungstool (mkisofs/xorriso) gefunden."
-  exit 1
+    echo "⚠️ Kein Overlay-Verzeichnis gefunden ($OVERLAY)"
 fi
 
-# ---------------------------------------------------------------
-# Bootfähiges Hybrid-ISO erzeugen (UEFI + BIOS)
-# ---------------------------------------------------------------
+# --- Bootfähiges Hybrid-ISO erstellen ---------------------------
 echo ">>> Erzeuge bootfähiges Hybrid-ISO (UEFI + Legacy BIOS)..."
-$ISO_CMD -R -J -T -V "Oracle_Migration_Live" \
-  -o "$ISO_OUT" "$WORKDIR/custom_iso" \
-  -b isolinux/isolinux.bin \
-  -c isolinux/boot.cat \
-  -no-emul-boot \
-  -boot-load-size 4 \
-  -boot-info-table \
+run xorriso -as mkisofs \
+  -iso-level 3 \
+  -UDF \
+  -full-iso9660-filenames \
+  -allow-limited-size \
+  -volid "ORACLE-MIGRATION" \
+  -eltorito-boot isolinux/isolinux.bin \
+  -eltorito-catalog isolinux/boot.cat \
+  -no-emul-boot -boot-load-size 4 -boot-info-table \
   -eltorito-alt-boot \
-  -e images/efiboot.img \
-  -no-emul-boot \
-  -isohybrid-gpt-basdat
+  -e images/efiboot.img -no-emul-boot -isohybrid-gpt-basdat \
+  -output "$ISO_OUT" "$EXTRACT"
 
-echo "✅ Bootfähiges Hybrid-ISO erfolgreich erstellt: $ISO_OUT"
+# --- Abschluss --------------------------------------------------
+if [ -f "$ISO_OUT" ]; then
+    echo "✅ ISO erfolgreich erstellt!"
+    ls -lh "$ISO_OUT"
+else
+    echo "❌ ISO-Erstellung fehlgeschlagen!"
+    exit 1
+fi
+
+echo "🎉 Build abgeschlossen."
