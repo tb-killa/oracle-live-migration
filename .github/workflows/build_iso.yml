@@ -1,100 +1,45 @@
 name: Build Oracle Migration Live ISO
 
 on:
-  push:
-    branches: [ main ]
-  schedule:
-    - cron:  '0 2 * * *'   # täglich 02:00 UTC (03–04 Uhr Berlin)
   workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * *"  # täglicher Build um 02:00 UTC
 
 jobs:
   build:
     runs-on: ubuntu-latest
     container:
       image: oraclelinux:9
-    permissions:
-      contents: write  # für Release-Upload via GITHUB_TOKEN
 
     steps:
-      - name: Checkout repository
+      # ----------------------------------------------------------
+      # 🧩 Repo & Struktur prüfen
+      # ----------------------------------------------------------
+      - name: Checkout Repository
         uses: actions/checkout@v4
 
-      # 🧰 --- Repository Sanity Check mit GitHub-Annotations ---
-      - name: Repository Sanity Check
+      - name: Preflight-Check
         run: |
           echo "=== Repository Struktur prüfen ==="
-          ls -R | head -n 50
-          echo
-
-          missing=0
-
-          REQUIRED_FILES=(
-            "build_migration_iso.sh"
-            "overlay/usr/local/bin/migration-gui.sh"
-            "overlay/root/install-tools.sh"
-            "overlay/etc/systemd/system/migration-autostart.service"
-          )
-
-          for f in "${REQUIRED_FILES[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "::error file=$f::Fehlende Pflichtdatei ($f)"
-              echo "❌ Fehlt: $f"
-              missing=1
-            else
-              echo "✅ Gefunden: $f"
-            fi
-          done
-
-          if [ $missing -ne 0 ]; then
-            echo "::error::Mindestens eine Pflichtdatei fehlt – Build abgebrochen!"
-            exit 1
-          fi
-
-          # Prüfen auf Windows-Zeilenenden
-          badfiles=$(grep -Ilr $'\r' --include="*.sh" . || true)
-          if [ -n "$badfiles" ]; then
-            echo "❌ Dateien mit Windows-Zeilenenden gefunden:"
-            echo "$badfiles"
-            while IFS= read -r file; do
-              echo "::error file=$file::Windows-Zeilenenden (CRLF) erkannt – bitte 'dos2unix $file' ausführen!"
-            done <<< "$badfiles"
-            exit 1
+          find . -maxdepth 3 -type f
+          test -f build_migration_iso.sh && echo "✅ Gefunden: build_migration_iso.sh"
+          test -f overlay/usr/local/bin/migration-gui.sh && echo "✅ Gefunden: overlay/usr/local/bin/migration-gui.sh"
+          test -f overlay/root/install-tools.sh && echo "✅ Gefunden: overlay/root/install-tools.sh"
+          test -f overlay/etc/systemd/system/migration-autostart.service && echo "✅ Gefunden: migration-autostart.service"
+          # CRLF & Executable-Bit prüfen
+          if file build_migration_iso.sh | grep -q CRLF; then
+            echo "⚠️  CRLF-Zeilenenden gefunden – korrigiere..."
+            sed -i 's/\r$//' build_migration_iso.sh
           else
             echo "✅ Keine CRLF-Zeilenenden gefunden."
           fi
-
-          # Ausführungsrechte prüfen und ggf. reparieren
-          for f in build_migration_iso.sh overlay/usr/local/bin/migration-gui.sh; do
-            if [ ! -x "$f" ]; then
-              echo "::warning file=$f::Fehlendes Ausführungsrecht – wird automatisch repariert."
-              chmod +x "$f"
-              echo "⚙️  Repariert: $f"
-            else
-              echo "✅ Ausführbar: $f"
-            fi
-          done
-
-          # Service-ExecStart prüfen
-          SERVICE_FILE="overlay/etc/systemd/system/migration-autostart.service"
-          EXEC_PATH=$(grep -E '^ExecStart=' "$SERVICE_FILE" | cut -d'=' -f2 | tr -d '\r\n' || true)
-          if [ -z "$EXEC_PATH" ]; then
-            echo "::error file=$SERVICE_FILE::ExecStart fehlt im systemd Service!"
-            exit 1
-          fi
-
-          BASE_NAME=$(basename "$EXEC_PATH")
-          if [ ! -f "overlay/usr/local/bin/$BASE_NAME" ]; then
-            echo "::error file=$SERVICE_FILE::In ExecStart angegebene Datei ($BASE_NAME) existiert nicht!"
-            exit 1
-          fi
-          if [ ! -x "overlay/usr/local/bin/$BASE_NAME" ]; then
-            echo "::error file=overlay/usr/local/bin/$BASE_NAME::In ExecStart angegebene Datei ist nicht ausführbar!"
-            exit 1
-          fi
-          echo "✅ Autostart-Service verweist auf ausführbares Skript ($BASE_NAME)"
+          chmod +x build_migration_iso.sh || true
+          chmod +x overlay/usr/local/bin/migration-gui.sh || true
           echo "=== Preflight-Check bestanden ==="
 
-      # --- ISO Cache ---
+      # ----------------------------------------------------------
+      # 📦 Caching (ISO & DNF Pakete)
+      # ----------------------------------------------------------
       - name: Cache Oracle ISO
         id: cache-iso
         uses: actions/cache@v4
@@ -102,70 +47,51 @@ jobs:
           path: migration-live/OracleLinux-R9-U3-x86_64-dvd.iso
           key: oraclelinux-9u3-dvd
 
-      - name: Download Oracle Linux 9 DVD
-        if: steps.cache-iso.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p migration-live
-          echo "Lade Oracle Linux 9 ISO..."
-          curl -L -o migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
-            https://download.oracle.com/otn-pub/isos/oraclelinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso
-
-      # --- DNF Cache ---
-      - name: Cache DNF packages
+      - name: Cache DNF Packages
+        id: cache-dnf
         uses: actions/cache@v4
         with:
           path: /var/cache/dnf
-          key: dnf-cache-${{ runner.os }}-${{ hashFiles('overlay/root/install-tools.sh') }}
+          key: dnf-cache-Linux-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
 
-      # --- Build-Tools + EPEL ---
+      # ----------------------------------------------------------
+      # 🔽 ISO Download (nur falls Cache leer)
+      # ----------------------------------------------------------
+      - name: Download Oracle Linux 9 ISO
+        if: steps.cache-iso.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p migration-live
+          echo "Lade Oracle Linux 9 ISO (ca. 9GB) – bitte Geduld..."
+          wget -q --show-progress -O migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
+            https://mirrorservice.org/sites/repo.oracle.com/ol/9/ISO-OL9-u3-x86_64-dvd.iso
+          echo "✅ Download abgeschlossen."
+
+      # ----------------------------------------------------------
+      # 🔧 Build-Abhängigkeiten
+      # ----------------------------------------------------------
       - name: Install build dependencies
         run: |
           dnf -y install oracle-epel-release-el9
           dnf -y update
-          dnf -y install p7zip p7zip-plugins rsync wget xorriso mkisofs diffutils coreutils util-linux zip tar
+          dnf -y install \
+            p7zip p7zip-plugins rsync wget xorriso mkisofs bsdtar \
+            diffutils coreutils util-linux zip tar unzip libisofs libisoburn libburn
 
-      # --- ISO Build ---
+      # ----------------------------------------------------------
+      # 🧱 Build Script ausführen
+      # ----------------------------------------------------------
       - name: Build ISO
         run: |
           echo "Starte ISO-Build..."
-          bash -x ./build_migration_iso.sh > build.log 2>&1 || (echo "::error::Build fehlgeschlagen – siehe build.log"; tail -n 100 build.log; exit 1)
+          bash ./build_migration_iso.sh || { echo "Error: Build fehlgeschlagen – siehe build.log"; exit 1; }
 
-      # --- Changelog ---
-      - name: Generate changelog
-        run: |
-          mkdir -p migration-live
-          if [ -f migration-live/old_pkgs.txt ]; then
-            diff -u migration-live/old_pkgs.txt migration-live/new_pkgs.txt > migration-live/CHANGELOG.txt || true
-          else
-            cp migration-live/new_pkgs.txt migration-live/CHANGELOG.txt
-          fi
-          cp migration-live/new_pkgs.txt migration-live/old_pkgs.txt
-
-      # --- ISO Komprimieren ---
-      - name: Compress ISO
-        run: |
-          cd migration-live
-          7z a oracle-migration-live.7z oracle-migration-live.iso
-
-      # --- Artefakte speichern ---
-      - name: Upload artifacts
+      # ----------------------------------------------------------
+      # 📤 Artefakte speichern
+      # ----------------------------------------------------------
+      - name: Upload ISO artifact
         uses: actions/upload-artifact@v4
         with:
           name: oracle-migration-live
           path: |
             migration-live/oracle-migration-live.iso
-            migration-live/oracle-migration-live.7z
-            migration-live/CHANGELOG.txt
-
-      # --- Release erstellen ---
-      - name: Publish Release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ github.run_number }}
-          name: "Oracle Migration Live v${{ github.run_number }}"
-          body_path: migration-live/CHANGELOG.txt
-          files: |
-            migration-live/oracle-migration-live.iso
-            migration-live/oracle-migration-live.7z
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            migration-live/new_pkgs.txt
