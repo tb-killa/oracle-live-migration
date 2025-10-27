@@ -1,6 +1,9 @@
 #!/bin/bash
 # ===============================================================
-#  Oracle Linux Migration Live ISO Builder (Minimal, Deutsch, Offline)
+#  Oracle Linux Migration Live ISO Builder
+#  - Läuft sowohl lokal als auch im GitHub Actions Container
+#  - Erkennt automatisch verfügbares ISO-Erzeugungs-Tool
+#  - Kein sudo erforderlich
 # ===============================================================
 set -euo pipefail
 
@@ -12,7 +15,7 @@ OVERLAY="$(pwd)/overlay"
 echo "=== Building Oracle Migration Live ISO ==="
 mkdir -p "$WORKDIR/custom_iso" "$WORKDIR/mnt"
 
-# Funktion für Root/Sudo-kompatible Befehle
+# Root/Sudo-Kompatibilität
 run() {
   if command -v sudo >/dev/null 2>&1; then
     sudo "$@"
@@ -21,7 +24,9 @@ run() {
   fi
 }
 
-# Paketstände protokollieren (für Changelog)
+# ---------------------------------------------------------------
+# Paketstände protokollieren (für späteren Changelog)
+# ---------------------------------------------------------------
 {
   echo "=== Paketliste $(date -u) UTC ==="
   if command -v dnf >/dev/null 2>&1; then
@@ -31,25 +36,45 @@ run() {
   rpm -qa --qf "%{NAME}-%{VERSION}-%{RELEASE}\n" | sort
 } > "$WORKDIR/new_pkgs.txt"
 
-# ISO mounten & kopieren
+# ---------------------------------------------------------------
+# ISO mounten (oder Dummy verwenden)
+# ---------------------------------------------------------------
 echo ">>> Mount ISO: $ISO_SRC"
-run mount -o loop "$ISO_SRC" "$WORKDIR/mnt" || {
-  echo "⚠️ Mount fehlgeschlagen, leeres Zielverzeichnis verwenden."
+if ! run mount -o loop "$ISO_SRC" "$WORKDIR/mnt" 2>/dev/null; then
+  echo "⚠️ Mount fehlgeschlagen, lege Dummy-Struktur an..."
   mkdir -p "$WORKDIR/mnt"
-}
+fi
 
 rsync -a "$WORKDIR/mnt/" "$WORKDIR/custom_iso/" || true
 run umount "$WORKDIR/mnt" 2>/dev/null || true
 
+# ---------------------------------------------------------------
 # Overlay einspielen
-echo ">>> Kopiere Overlay..."
+# ---------------------------------------------------------------
+echo ">>> Kopiere Overlay-Dateien..."
 rsync -a "$OVERLAY/" "$WORKDIR/custom_iso/"
 
-# Neues ISO erzeugen
+# ---------------------------------------------------------------
+# ISO-Erzeugungstool erkennen
+# ---------------------------------------------------------------
 echo ">>> Erzeuge ISO-Image..."
-genisoimage -R -J -T -V "Oracle Migration Live" \
+if command -v genisoimage >/dev/null 2>&1; then
+  ISO_CMD="genisoimage"
+elif command -v mkisofs >/dev/null 2>&1; then
+  ISO_CMD="mkisofs"
+elif command -v xorriso >/dev/null 2>&1; then
+  ISO_CMD="xorriso -as mkisofs"
+else
+  echo "❌ Kein ISO-Erzeugungstool gefunden (genisoimage/mkisofs/xorriso)"
+  exit 1
+fi
+
+# ---------------------------------------------------------------
+# ISO erzeugen
+# ---------------------------------------------------------------
+$ISO_CMD -R -J -T -V "Oracle Migration Live" \
   -b isolinux/isolinux.bin -c isolinux/boot.cat \
   -no-emul-boot -boot-load-size 4 -boot-info-table \
   -o "$ISO_OUT" "$WORKDIR/custom_iso"
 
-echo "✅ ISO erstellt: $ISO_OUT"
+echo "✅ ISO erfolgreich erstellt: $ISO_OUT"
