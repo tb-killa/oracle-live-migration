@@ -4,19 +4,22 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron:  '0 2 * * *'  # täglich 02:00 UTC (Hinweis: entspricht 03:00/04:00 in Berlin je nach DST)
+    - cron:  '0 2 * * *'   # jeden Tag um 02:00 UTC
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    container:
+      image: oraclelinux:9
     permissions:
-      contents: write   # nötig für Release-Upload via GITHUB_TOKEN
+      contents: write  # notwendig für Release-Upload via GITHUB_TOKEN
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Cache für ISO, um Bandbreite zu sparen
       - name: Cache Oracle ISO
         id: cache-iso
         uses: actions/cache@v4
@@ -24,29 +27,33 @@ jobs:
           path: migration-live/OracleLinux-R9-U3-x86_64-dvd.iso
           key: oraclelinux-9u3-dvd
 
-      - name: Download Oracle Linux 9 DVD
+      - name: Download Oracle Linux 9 DVD (falls nicht im Cache)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
           mkdir -p migration-live
-          wget -q https://download.oracle.com/otn-pub/isos/oraclelinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso \
-            -O migration-live/OracleLinux-R9-U3-x86_64-dvd.iso
+          echo "Lade Oracle Linux 9 ISO..."
+          curl -L -o migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
+            https://download.oracle.com/otn-pub/isos/oraclelinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso
 
+      # Cache für DNF, um Buildzeiten zu reduzieren
       - name: Cache DNF packages
         uses: actions/cache@v4
         with:
-          path: ~/.cache/dnf
+          path: /var/cache/dnf
           key: dnf-cache-${{ runner.os }}-${{ hashFiles('overlay/root/install-tools.sh') }}
 
+      # Baurelevante Tools installieren (im OracleLinux9-Container!)
       - name: Install build dependencies
         run: |
-          sudo apt update
-          sudo apt install -y genisoimage rsync wget xorriso p7zip-full diffutils
+          dnf -y install genisoimage rsync wget xorriso p7zip diffutils coreutils util-linux
 
+      # Build starten
       - name: Build ISO
         run: |
           chmod +x build_migration_iso.sh
-          sudo ./build_migration_iso.sh > build.log 2>&1 || (tail -n 200 build.log; exit 1)
+          bash -x ./build_migration_iso.sh > build.log 2>&1
 
+      # Änderungen zwischen Paketlisten als Changelog speichern
       - name: Generate changelog
         run: |
           mkdir -p migration-live
@@ -57,11 +64,13 @@ jobs:
           fi
           cp migration-live/new_pkgs.txt migration-live/old_pkgs.txt
 
+      # ISO komprimieren (schnellerer Download)
       - name: Compress ISO
         run: |
           cd migration-live
           7z a oracle-migration-live.7z oracle-migration-live.iso
 
+      # Build-Artefakte für manuellen Download
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -71,7 +80,8 @@ jobs:
             migration-live/oracle-migration-live.7z
             migration-live/CHANGELOG.txt
 
-      - name: Publish release
+      # Automatisches Release mit Version + Changelog
+      - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: v${{ github.run_number }}
@@ -81,4 +91,4 @@ jobs:
             migration-live/oracle-migration-live.iso
             migration-live/oracle-migration-live.7z
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
