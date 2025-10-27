@@ -41,30 +41,42 @@ run() {
 # ---------------------------------------------------------------
 echo ">>> Extrahiere ISO-Inhalt..."
 cd "$WORKDIR"
+
 if command -v 7z >/dev/null 2>&1; then
-  7z x -y -o"$WORKDIR/custom_iso" "$ISO_SRC" > /dev/null
+  EXTRACTOR="7z x -y -o$WORKDIR/custom_iso"
+elif command -v 7za >/dev/null 2>&1; then
+  EXTRACTOR="7za x -y -o$WORKDIR/custom_iso"
 elif command -v bsdtar >/dev/null 2>&1; then
-  bsdtar -xf "$ISO_SRC" -C "$WORKDIR/custom_iso"
+  EXTRACTOR="bsdtar -xf -C $WORKDIR/custom_iso"
 else
-  echo "❌ Kein Entpackprogramm (7z oder bsdtar) gefunden!"
+  echo "❌ Kein Entpackprogramm gefunden (7z / 7za / bsdtar)!"
   exit 1
 fi
+
+echo ">>> Verwende Entpacker: ${EXTRACTOR%% *}"
+$EXTRACTOR "$ISO_SRC" > /dev/null
 cd - >/dev/null
 
 # ---------------------------------------------------------------
 # Bootdateien prüfen
 # ---------------------------------------------------------------
 echo ">>> Prüfe Bootdateien..."
-if [ ! -f "$WORKDIR/custom_iso/isolinux/isolinux.bin" ]; then
-  echo "❌ isolinux/isolinux.bin fehlt – Legacy Boot nicht möglich!"
-  exit 1
-fi
-if [ ! -f "$WORKDIR/custom_iso/isolinux/boot.cat" ]; then
-  echo "❌ isolinux/boot.cat fehlt – Legacy Boot nicht möglich!"
-  exit 1
-fi
-if [ ! -f "$WORKDIR/custom_iso/images/efiboot.img" ]; then
-  echo "❌ images/efiboot.img fehlt – UEFI Boot nicht möglich!"
+missing=0
+
+for file in \
+  "$WORKDIR/custom_iso/isolinux/isolinux.bin" \
+  "$WORKDIR/custom_iso/isolinux/boot.cat" \
+  "$WORKDIR/custom_iso/images/efiboot.img"; do
+  if [ ! -f "$file" ]; then
+    echo "❌ Fehlende Bootdatei: $file"
+    missing=1
+  else
+    echo "✅ Gefunden: ${file##*/}"
+  fi
+done
+
+if [ $missing -ne 0 ]; then
+  echo "❌ Mindestens eine Bootdatei fehlt – Build abgebrochen!"
   exit 1
 fi
 
