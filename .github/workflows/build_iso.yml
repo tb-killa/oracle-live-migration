@@ -4,7 +4,7 @@ on:
   push:
     branches: [ main ]
   schedule:
-    - cron:  '0 2 * * *'   # jeden Tag um 02:00 UTC
+    - cron:  '0 2 * * *'   # täglich 02:00 UTC
   workflow_dispatch:
 
 jobs:
@@ -19,7 +19,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Cache für ISO, um Bandbreite zu sparen
+      # Cache für ISO (spart 8GB Download)
       - name: Cache Oracle ISO
         id: cache-iso
         uses: actions/cache@v4
@@ -42,18 +42,22 @@ jobs:
           path: /var/cache/dnf
           key: dnf-cache-${{ runner.os }}-${{ hashFiles('overlay/root/install-tools.sh') }}
 
-      # Baurelevante Tools installieren (im OracleLinux9-Container!)
+      # Installiert Buildtools + EPEL (für p7zip)
       - name: Install build dependencies
         run: |
-          dnf -y install genisoimage rsync wget xorriso p7zip diffutils coreutils util-linux
+          echo "Aktualisiere Paketquellen..."
+          dnf -y install oracle-epel-release-el9
+          dnf -y update
+          echo "Installiere benötigte Build-Tools..."
+          dnf -y install genisoimage rsync wget xorriso p7zip diffutils coreutils util-linux zip tar
 
-      # Build starten
+      # Haupt-Build-Schritt
       - name: Build ISO
         run: |
           chmod +x build_migration_iso.sh
           bash -x ./build_migration_iso.sh > build.log 2>&1
 
-      # Änderungen zwischen Paketlisten als Changelog speichern
+      # Paket-Änderungen als Changelog dokumentieren
       - name: Generate changelog
         run: |
           mkdir -p migration-live
@@ -64,14 +68,14 @@ jobs:
           fi
           cp migration-live/new_pkgs.txt migration-live/old_pkgs.txt
 
-      # ISO komprimieren (schnellerer Download)
+      # ISO in 7z komprimieren
       - name: Compress ISO
         run: |
           cd migration-live
           7z a oracle-migration-live.7z oracle-migration-live.iso
 
-      # Build-Artefakte für manuellen Download
-      - name: Upload artifacts
+      # Upload der Artefakte
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: oracle-migration-live
@@ -80,7 +84,7 @@ jobs:
             migration-live/oracle-migration-live.7z
             migration-live/CHANGELOG.txt
 
-      # Automatisches Release mit Version + Changelog
+      # Automatisches Release mit Changelog und Version
       - name: Publish Release
         uses: softprops/action-gh-release@v2
         with:
@@ -91,4 +95,4 @@ jobs:
             migration-live/oracle-migration-live.iso
             migration-live/oracle-migration-live.7z
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} 
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
