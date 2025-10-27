@@ -37,24 +37,37 @@ run() {
 } > "$WORKDIR/new_pkgs.txt"
 
 # ---------------------------------------------------------------
-# ISO extrahieren (statt mounten, da GitHub Actions kein loopdev)
+# ISO extrahieren (xorriso-kompatibel, kein Mount nötig)
 # ---------------------------------------------------------------
 echo ">>> Extrahiere ISO-Inhalt..."
 cd "$WORKDIR"
 
-if command -v 7z >/dev/null 2>&1; then
-  EXTRACTOR="7z x -y -o$WORKDIR/custom_iso"
-elif command -v 7za >/dev/null 2>&1; then
-  EXTRACTOR="7za x -y -o$WORKDIR/custom_iso"
+if command -v xorriso >/dev/null 2>&1; then
+  echo ">>> Verwende xorriso für Extraktion (UDF-kompatibel)..."
+  xorriso -osirrox on -indev "$ISO_SRC" -extract / "$WORKDIR/custom_iso"
 elif command -v bsdtar >/dev/null 2>&1; then
-  EXTRACTOR="bsdtar -xf -C $WORKDIR/custom_iso"
+  echo ">>> Fallback: Verwende bsdtar..."
+  bsdtar -xf "$ISO_SRC" -C "$WORKDIR/custom_iso"
+elif command -v 7z >/dev/null 2>&1; then
+  echo ">>> Letzter Versuch: Verwende 7z..."
+  7z x -y -o"$WORKDIR/custom_iso" "$ISO_SRC"
+elif command -v 7za >/dev/null 2>&1; then
+  echo ">>> Letzter Versuch: Verwende 7za..."
+  7za x -y -o"$WORKDIR/custom_iso" "$ISO_SRC"
 else
-  echo "❌ Kein Entpackprogramm gefunden (7z / 7za / bsdtar)!"
+  echo "❌ Kein Entpackwerkzeug (xorriso, bsdtar, 7z/7za) gefunden!"
   exit 1
 fi
 
-echo ">>> Verwende Entpacker: ${EXTRACTOR%% *}"
-$EXTRACTOR "$ISO_SRC" > /dev/null
+# ---------------------------------------------------------------
+# Testausgabe – zeige extrahierte Hauptverzeichnisse
+# ---------------------------------------------------------------
+echo ">>> Testausgabe: Beispielhafte Inhalte aus dem ISO:"
+ls -l "$WORKDIR/custom_iso" | head -n 15 || true
+ls -l "$WORKDIR/custom_iso/isolinux" 2>/dev/null | head -n 5 || true
+ls -l "$WORKDIR/custom_iso/images" 2>/dev/null | head -n 5 || true
+echo "---------------------------------------------------------------"
+
 cd - >/dev/null
 
 # ---------------------------------------------------------------
@@ -62,7 +75,6 @@ cd - >/dev/null
 # ---------------------------------------------------------------
 echo ">>> Prüfe Bootdateien..."
 missing=0
-
 for file in \
   "$WORKDIR/custom_iso/isolinux/isolinux.bin" \
   "$WORKDIR/custom_iso/isolinux/boot.cat" \
