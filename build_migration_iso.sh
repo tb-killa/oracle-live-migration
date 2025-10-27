@@ -12,23 +12,41 @@ OVERLAY="$(pwd)/overlay"
 echo "=== Building Oracle Migration Live ISO ==="
 mkdir -p "$WORKDIR/custom_iso" "$WORKDIR/mnt"
 
+# Funktion für Root/Sudo-kompatible Befehle
+run() {
+  if command -v sudo >/dev/null 2>&1; then
+    sudo "$@"
+  else
+    "$@"
+  fi
+}
+
 # Paketstände protokollieren (für Changelog)
 {
   echo "=== Paketliste $(date -u) UTC ==="
-  sudo dnf clean all || true
-  sudo dnf -y update || true
+  if command -v dnf >/dev/null 2>&1; then
+    run dnf clean all || true
+    run dnf -y update || true
+  fi
   rpm -qa --qf "%{NAME}-%{VERSION}-%{RELEASE}\n" | sort
 } > "$WORKDIR/new_pkgs.txt"
 
 # ISO mounten & kopieren
-sudo mount -o loop "$ISO_SRC" "$WORKDIR/mnt"
-rsync -a "$WORKDIR/mnt/" "$WORKDIR/custom_iso/"
-sudo umount "$WORKDIR/mnt"
+echo ">>> Mount ISO: $ISO_SRC"
+run mount -o loop "$ISO_SRC" "$WORKDIR/mnt" || {
+  echo "⚠️ Mount fehlgeschlagen, leeres Zielverzeichnis verwenden."
+  mkdir -p "$WORKDIR/mnt"
+}
+
+rsync -a "$WORKDIR/mnt/" "$WORKDIR/custom_iso/" || true
+run umount "$WORKDIR/mnt" 2>/dev/null || true
 
 # Overlay einspielen
+echo ">>> Kopiere Overlay..."
 rsync -a "$OVERLAY/" "$WORKDIR/custom_iso/"
 
 # Neues ISO erzeugen
+echo ">>> Erzeuge ISO-Image..."
 genisoimage -R -J -T -V "Oracle Migration Live" \
   -b isolinux/isolinux.bin -c isolinux/boot.cat \
   -no-emul-boot -boot-load-size 4 -boot-info-table \
