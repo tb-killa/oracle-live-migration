@@ -13,7 +13,7 @@ jobs:
 
     steps:
       # ----------------------------------------------------------
-      # 🧩 Repo & Struktur prüfen
+      # 🧩 Repository vorbereiten und prüfen
       # ----------------------------------------------------------
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -23,22 +23,25 @@ jobs:
           echo "=== Repository Struktur prüfen ==="
           find . -maxdepth 3 -type f
           test -f build_migration_iso.sh && echo "✅ Gefunden: build_migration_iso.sh"
-          test -f overlay/usr/local/bin/migration-gui.sh && echo "✅ Gefunden: overlay/usr/local/bin/migration-gui.sh"
-          test -f overlay/root/install-tools.sh && echo "✅ Gefunden: overlay/root/install-tools.sh"
-          test -f overlay/etc/systemd/system/migration-autostart.service && echo "✅ Gefunden: migration-autostart.service"
-          # CRLF & Executable-Bit prüfen
+          test -f overlay/usr/local/bin/migration-gui.sh && echo "✅ Gefunden: migration-gui.sh"
+          test -f overlay/root/install-tools.sh && echo "✅ Gefunden: install-tools.sh"
+          test -f overlay/etc/systemd/system/migration-autostart.service && echo "✅ Gefunden: autostart.service"
+
+          # CRLF-Zeilenenden prüfen und korrigieren
           if file build_migration_iso.sh | grep -q CRLF; then
             echo "⚠️  CRLF-Zeilenenden gefunden – korrigiere..."
             sed -i 's/\r$//' build_migration_iso.sh
           else
             echo "✅ Keine CRLF-Zeilenenden gefunden."
           fi
+
+          # Ausführungsrechte setzen
           chmod +x build_migration_iso.sh || true
           chmod +x overlay/usr/local/bin/migration-gui.sh || true
           echo "=== Preflight-Check bestanden ==="
 
       # ----------------------------------------------------------
-      # 📦 Caching (ISO & DNF Pakete)
+      # 🧱 Cache (ISO + DNF)
       # ----------------------------------------------------------
       - name: Cache Oracle ISO
         id: cache-iso
@@ -52,22 +55,24 @@ jobs:
         uses: actions/cache@v4
         with:
           path: /var/cache/dnf
-          key: dnf-cache-Linux-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
+          key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
 
       # ----------------------------------------------------------
-      # 🔽 ISO Download (nur falls Cache leer)
+      # 🔽 ISO Download (wenn nicht gecached)
       # ----------------------------------------------------------
       - name: Download Oracle Linux 9 ISO
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
           mkdir -p migration-live
-          echo "Lade Oracle Linux 9 ISO (ca. 9GB) – bitte Geduld..."
+          echo "🔧 Installiere wget..."
+          dnf -y install wget
+          echo "📦 Lade Oracle Linux 9 ISO (ca. 9 GB) – bitte Geduld..."
           wget -q --show-progress -O migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
             https://mirrorservice.org/sites/repo.oracle.com/ol/9/ISO-OL9-u3-x86_64-dvd.iso
           echo "✅ Download abgeschlossen."
 
       # ----------------------------------------------------------
-      # 🔧 Build-Abhängigkeiten
+      # ⚙️ Build-Abhängigkeiten installieren
       # ----------------------------------------------------------
       - name: Install build dependencies
         run: |
@@ -75,18 +80,19 @@ jobs:
           dnf -y update
           dnf -y install \
             p7zip p7zip-plugins rsync wget xorriso mkisofs bsdtar \
-            diffutils coreutils util-linux zip tar unzip libisofs libisoburn libburn
+            diffutils coreutils util-linux zip tar unzip \
+            libisofs libisoburn libburn
 
       # ----------------------------------------------------------
-      # 🧱 Build Script ausführen
+      # 🧰 ISO-Build durchführen
       # ----------------------------------------------------------
       - name: Build ISO
         run: |
-          echo "Starte ISO-Build..."
-          bash ./build_migration_iso.sh || { echo "Error: Build fehlgeschlagen – siehe build.log"; exit 1; }
+          echo "🚀 Starte ISO-Build..."
+          bash ./build_migration_iso.sh || { echo "❌ Build fehlgeschlagen – siehe Log"; exit 1; }
 
       # ----------------------------------------------------------
-      # 📤 Artefakte speichern
+      # 📤 Artefakte hochladen
       # ----------------------------------------------------------
       - name: Upload ISO artifact
         uses: actions/upload-artifact@v4
