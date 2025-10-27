@@ -13,42 +13,27 @@ jobs:
 
     steps:
       # ----------------------------------------------------------
-      # 🧩 Repository vorbereiten und prüfen
+      # 🧩 Repository prüfen
       # ----------------------------------------------------------
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      - name: Preflight-Check
+      - name: Preflight Check
         run: |
           echo "=== Repository Struktur prüfen ==="
-          find . -maxdepth 3 -type f
-          test -f build_migration_iso.sh && echo "✅ Gefunden: build_migration_iso.sh"
-          test -f overlay/usr/local/bin/migration-gui.sh && echo "✅ Gefunden: migration-gui.sh"
-          test -f overlay/root/install-tools.sh && echo "✅ Gefunden: install-tools.sh"
-          test -f overlay/etc/systemd/system/migration-autostart.service && echo "✅ Gefunden: autostart.service"
-
-          # CRLF-Zeilenenden prüfen und korrigieren
-          if file build_migration_iso.sh | grep -q CRLF; then
-            echo "⚠️  CRLF-Zeilenenden gefunden – korrigiere..."
-            sed -i 's/\r$//' build_migration_iso.sh
-          else
-            echo "✅ Keine CRLF-Zeilenenden gefunden."
-          fi
-
-          # Ausführungsrechte setzen
+          test -f build_migration_iso.sh && echo "✅ build_migration_iso.sh gefunden"
           chmod +x build_migration_iso.sh || true
           chmod +x overlay/usr/local/bin/migration-gui.sh || true
-          echo "=== Preflight-Check bestanden ==="
 
       # ----------------------------------------------------------
-      # 🧱 Cache (ISO + DNF)
+      # 🧱 Cache für ISO & DNF
       # ----------------------------------------------------------
       - name: Cache Oracle ISO
         id: cache-iso
         uses: actions/cache@v4
         with:
           path: migration-live/OracleLinux-R9-U3-x86_64-dvd.iso
-          key: oraclelinux-9u3-dvd
+          key: oraclelinux9u3-dvd-cache
 
       - name: Cache DNF Packages
         id: cache-dnf
@@ -58,21 +43,29 @@ jobs:
           key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
 
       # ----------------------------------------------------------
-      # 🔽 ISO Download (wenn nicht gecached)
+      # 🔽 ISO nur herunterladen, wenn Cache fehlt
       # ----------------------------------------------------------
-      - name: Download Oracle Linux 9 ISO
+      - name: Download Oracle Linux 9 ISO (nur bei Bedarf)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
           mkdir -p migration-live
           echo "🔧 Installiere wget..."
           dnf -y install wget
-          echo "📦 Lade Oracle Linux 9 ISO (ca. 9 GB) – bitte Geduld..."
-          wget -q --show-progress -O migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
+          echo "📦 Lade Oracle Linux 9 ISO (ca. 9 GB)..."
+          wget --progress=dot:giga -O migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
             https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso
           echo "✅ Download abgeschlossen."
+          echo "📏 Prüfe Dateigröße..."
+          size=$(stat -c%s migration-live/OracleLinux-R9-U3-x86_64-dvd.iso)
+          echo "Größe: $size Bytes"
+          if [ "$size" -lt 1000000000 ]; then
+            echo "❌ ISO scheint ungültig (zu klein) – Abbruch."
+            exit 1
+          fi
+          echo "✅ ISO gültig (>1 GB)."
 
       # ----------------------------------------------------------
-      # ⚙️ Build-Abhängigkeiten installieren
+      # ⚙️ Build-Abhängigkeiten
       # ----------------------------------------------------------
       - name: Install build dependencies
         run: |
@@ -84,9 +77,9 @@ jobs:
             libisofs libisoburn libburn
 
       # ----------------------------------------------------------
-      # 🧰 ISO-Build durchführen
+      # 🧰 ISO-Build
       # ----------------------------------------------------------
-      - name: Build ISO
+      - name: Build Migration ISO
         run: |
           echo "🚀 Starte ISO-Build..."
           bash ./build_migration_iso.sh || { echo "❌ Build fehlgeschlagen – siehe Log"; exit 1; }
