@@ -3,7 +3,8 @@ name: Build Oracle Migration Live ISO
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"  # täglicher Build um 02:00 UTC
+    # 🔁 einmal täglich um 03:00 UTC automatisch prüfen & bauen
+    - cron: "0 3 * * *"
 
 jobs:
   build:
@@ -11,86 +12,101 @@ jobs:
     container:
       image: oraclelinux:9
 
+    env:
+      ISO_DIR: migration-live
+      ISO_BASE_URL: https://yum.oracle.com/ISOS/OracleLinux/OL9
+      ISO_FILE: OracleLinux-R9-U3-x86_64-dvd.iso
+      BUILD_SCRIPT: build_migration_iso.sh
+
     steps:
-      # ----------------------------------------------------------
-      # 🧩 Repository prüfen
-      # ----------------------------------------------------------
-      - name: Checkout Repository
-        uses: actions/checkout@v4
+    # ------------------------------------------------------------
+    # 🧩 Repository
+    # ------------------------------------------------------------
+    - name: Checkout repository
+      uses: actions/checkout@v4
 
-      - name: Preflight Check
-        run: |
-          echo "=== Repository Struktur prüfen ==="
-          test -f build_migration_iso.sh && echo "✅ build_migration_iso.sh gefunden"
-          chmod +x build_migration_iso.sh || true
-          chmod +x overlay/usr/local/bin/migration-gui.sh || true
+    # ------------------------------------------------------------
+    # 🧠 Oracle Version dynamisch ermitteln (z. B. U3, U4 etc.)
+    # ------------------------------------------------------------
+    - name: Detect latest Oracle Linux 9 minor version
+      id: detect-version
+      run: |
+        echo "📦 Prüfe aktuelle Oracle Linux 9 Version..."
+        VERSION=$(curl -sL https://yum.oracle.com/ISOS/OracleLinux/OL9/ | \
+          grep -oE 'u[0-9]+' | sort -V | tail -n1)
+        echo "Detected version: $VERSION"
+        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
-      # ----------------------------------------------------------
-      # 🧱 Cache für ISO & DNF
-      # ----------------------------------------------------------
-      - name: Cache Oracle ISO
-        id: cache-iso
-        uses: actions/cache@v4
-        with:
-          path: migration-live/OracleLinux-R9-U3-x86_64-dvd.iso
-          key: oraclelinux9u3-dvd-cache
+    # ------------------------------------------------------------
+    # 🧩 ISO-CACHE abrufen
+    # ------------------------------------------------------------
+    - name: Restore Oracle Linux ISO cache
+      id: cache-iso
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.ISO_DIR }}/OracleLinux-R9-${{ steps.detect-version.outputs.version }}-x86_64-dvd.iso
+        key: oraclelinux9-${{ steps.detect-version.outputs.version }}-dvd-cache
 
-      - name: Cache DNF Packages
-        id: cache-dnf
-        uses: actions/cache@v4
-        with:
-          path: /var/cache/dnf
-          key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
+    # ------------------------------------------------------------
+    # 🧱 ISO nur herunterladen, wenn nicht im Cache
+    # ------------------------------------------------------------
+    - name: Download Oracle Linux ISO if missing
+      if: steps.cache-iso.outputs.cache-hit != 'true'
+      run: |
+        mkdir -p $ISO_DIR
+        ISO_NAME="OracleLinux-R9-${{ steps.detect-version.outputs.version }}-x86_64-dvd.iso"
+        ISO_URL="$ISO_BASE_URL/${{ steps.detect-version.outputs.version }}/x86_64/$ISO_NAME"
+        echo "📦 Lade Oracle Linux ISO von $ISO_URL"
+        dnf -y install wget
+        wget --progress=dot:giga -O "$ISO_DIR/$ISO_NAME" "$ISO_URL"
 
-      # ----------------------------------------------------------
-      # 🔽 ISO nur herunterladen, wenn Cache fehlt
-      # ----------------------------------------------------------
-      - name: Download Oracle Linux 9 ISO (nur bei Bedarf)
-        if: steps.cache-iso.outputs.cache-hit != 'true'
-        run: |
-          mkdir -p migration-live
-          echo "🔧 Installiere wget..."
-          dnf -y install wget
-          echo "📦 Lade Oracle Linux 9 ISO (ca. 9 GB)..."
-          wget --progress=dot:giga -O migration-live/OracleLinux-R9-U3-x86_64-dvd.iso \
-            https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso
-          echo "✅ Download abgeschlossen."
-          echo "📏 Prüfe Dateigröße..."
-          size=$(stat -c%s migration-live/OracleLinux-R9-U3-x86_64-dvd.iso)
-          echo "Größe: $size Bytes"
-          if [ "$size" -lt 1000000000 ]; then
-            echo "❌ ISO scheint ungültig (zu klein) – Abbruch."
-            exit 1
-          fi
-          echo "✅ ISO gültig (>1 GB)."
+    # ------------------------------------------------------------
+    # 💾 DNF-CACHE für Pakete (optional, spart Zeit)
+    # ------------------------------------------------------------
+    - name: Restore DNF cache
+      id: cache-dnf
+      uses: actions/cache@v4
+      with:
+        path: /var/cache/dnf
+        key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
 
-      # ----------------------------------------------------------
-      # ⚙️ Build-Abhängigkeiten
-      # ----------------------------------------------------------
-      - name: Install build dependencies
-        run: |
-          dnf -y install oracle-epel-release-el9
-          dnf -y update
-          dnf -y install \
-            p7zip p7zip-plugins rsync wget xorriso mkisofs bsdtar \
-            diffutils coreutils util-linux zip tar unzip \
-            libisofs libisoburn libburn
+    # ------------------------------------------------------------
+    # 🧰 Tools installieren
+    # ------------------------------------------------------------
+    - name: Install build dependencies
+      run: |
+        dnf -y install oracle-epel-release-el9
+        dnf -y install p7zip p7zip-plugins rsync wget xorriso zip unzip tar diffutils coreutils util-linux
 
-      # ----------------------------------------------------------
-      # 🧰 ISO-Build
-      # ----------------------------------------------------------
-      - name: Build Migration ISO
-        run: |
-          echo "🚀 Starte ISO-Build..."
-          bash ./build_migration_iso.sh || { echo "❌ Build fehlgeschlagen – siehe Log"; exit 1; }
+    # ------------------------------------------------------------
+    # 🧩 Preflight-Check
+    # ------------------------------------------------------------
+    - name: Preflight checks
+      run: |
+        echo "=== Repository Struktur prüfen ==="
+        test -f "$BUILD_SCRIPT" || (echo "❌ Fehlendes Build-Script!" && exit 1)
+        test -d overlay || (echo "❌ Overlay-Ordner fehlt!" && exit 1)
+        chmod +x "$BUILD_SCRIPT"
+        echo "✅ Struktur ok – Build kann starten."
 
-      # ----------------------------------------------------------
-      # 📤 Artefakte hochladen
-      # ----------------------------------------------------------
-      - name: Upload ISO artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: oracle-migration-live
-          path: |
-            migration-live/oracle-migration-live.iso
-            migration-live/new_pkgs.txt
+    # ------------------------------------------------------------
+    # 🚀 ISO-Build starten
+    # ------------------------------------------------------------
+    - name: Build Oracle Migration ISO
+      run: |
+        echo "🚀 Starte ISO-Build..."
+        mkdir -p $ISO_DIR
+        ISO_PATH="$ISO_DIR/OracleLinux-R9-${{ steps.detect-version.outputs.version }}-x86_64-dvd.iso"
+        export ISO_PATH
+        ./$BUILD_SCRIPT
+
+    # ------------------------------------------------------------
+    # 📦 ISO und Log hochladen
+    # ------------------------------------------------------------
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: oracle-migration-live-${{ steps.detect-version.outputs.version }}
+        path: |
+          migration-live/oracle-migration-live.iso
+          migration-live/build.log
