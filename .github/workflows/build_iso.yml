@@ -1,9 +1,10 @@
 name: Build Oracle Migration Live ISO
 
 on:
+  push:
   workflow_dispatch:
   schedule:
-    # 🔁 einmal täglich um 03:00 UTC automatisch prüfen & bauen
+    # 🔁 Täglicher automatischer Build um 03:00 UTC
     - cron: "0 3 * * *"
 
 jobs:
@@ -14,56 +15,54 @@ jobs:
 
     env:
       ISO_DIR: migration-live
-      ISO_BASE_URL: https://yum.oracle.com/ISOS/OracleLinux/OL9
-      ISO_FILE: OracleLinux-R9-U3-x86_64-dvd.iso
+      ISO_NAME: OracleLinux-R9-x86_64-dvd.iso
+      ISO_URL: https://yum.oracle.com/ISOS/OracleLinux/OL9/ISO-OL9-x86_64-dvd.iso
       BUILD_SCRIPT: build_migration_iso.sh
 
     steps:
     # ------------------------------------------------------------
-    # 🧩 Repository
+    # 🧩 Repository abrufen
     # ------------------------------------------------------------
     - name: Checkout repository
       uses: actions/checkout@v4
 
     # ------------------------------------------------------------
-    # 🧠 Oracle Version dynamisch ermitteln (z. B. U3, U4 etc.)
+    # 💾 ISO-CACHE wiederherstellen
     # ------------------------------------------------------------
-    - name: Detect latest Oracle Linux 9 minor version
-      id: detect-version
-      run: |
-        echo "📦 Prüfe aktuelle Oracle Linux 9 Version..."
-        VERSION=$(curl -sL https://yum.oracle.com/ISOS/OracleLinux/OL9/ | \
-          grep -oE 'u[0-9]+' | sort -V | tail -n1)
-        echo "Detected version: $VERSION"
-        echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-
-    # ------------------------------------------------------------
-    # 🧩 ISO-CACHE abrufen
-    # ------------------------------------------------------------
-    - name: Restore Oracle Linux ISO cache
+    - name: Restore Oracle Linux Base ISO cache
       id: cache-iso
       uses: actions/cache@v4
       with:
-        path: ${{ env.ISO_DIR }}/OracleLinux-R9-${{ steps.detect-version.outputs.version }}-x86_64-dvd.iso
-        key: oraclelinux9-${{ steps.detect-version.outputs.version }}-dvd-cache
+        path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
+        key: oraclelinux9-base-dvd-cache
 
     # ------------------------------------------------------------
-    # 🧱 ISO nur herunterladen, wenn nicht im Cache
+    # 📥 ISO nur herunterladen, wenn nicht im Cache
     # ------------------------------------------------------------
-    - name: Download Oracle Linux ISO if missing
+    - name: Download Oracle Linux Base ISO (if missing)
       if: steps.cache-iso.outputs.cache-hit != 'true'
       run: |
+        set -e
         mkdir -p $ISO_DIR
-        ISO_NAME="OracleLinux-R9-${{ steps.detect-version.outputs.version }}-x86_64-dvd.iso"
-        ISO_URL="$ISO_BASE_URL/${{ steps.detect-version.outputs.version }}/x86_64/$ISO_NAME"
-        echo "📦 Lade Oracle Linux ISO von $ISO_URL"
+        echo "📦 Lade Oracle Linux 9 Base ISO herunter..."
         dnf -y install wget
         wget --progress=dot:giga -O "$ISO_DIR/$ISO_NAME" "$ISO_URL"
+        echo "✅ Download abgeschlossen."
 
     # ------------------------------------------------------------
-    # 💾 DNF-CACHE für Pakete (optional, spart Zeit)
+    # 💾 ISO direkt nach Download in den Cache schreiben
     # ------------------------------------------------------------
-    - name: Restore DNF cache
+    - name: Save Oracle Linux ISO to cache
+      if: steps.cache-iso.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
+        key: oraclelinux9-base-dvd-cache
+
+    # ------------------------------------------------------------
+    # 💾 DNF Cache (optional, beschleunigt Paketinstallationen)
+    # ------------------------------------------------------------
+    - name: Restore DNF package cache
       id: cache-dnf
       uses: actions/cache@v4
       with:
@@ -71,7 +70,7 @@ jobs:
         key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
 
     # ------------------------------------------------------------
-    # 🧰 Tools installieren
+    # 🧰 Build-Abhängigkeiten installieren
     # ------------------------------------------------------------
     - name: Install build dependencies
       run: |
@@ -79,11 +78,11 @@ jobs:
         dnf -y install p7zip p7zip-plugins rsync wget xorriso zip unzip tar diffutils coreutils util-linux
 
     # ------------------------------------------------------------
-    # 🧩 Preflight-Check
+    # 🧩 Preflight-Check: Struktur prüfen
     # ------------------------------------------------------------
     - name: Preflight checks
       run: |
-        echo "=== Repository Struktur prüfen ==="
+        echo "=== Repository-Struktur prüfen ==="
         test -f "$BUILD_SCRIPT" || (echo "❌ Fehlendes Build-Script!" && exit 1)
         test -d overlay || (echo "❌ Overlay-Ordner fehlt!" && exit 1)
         chmod +x "$BUILD_SCRIPT"
@@ -95,18 +94,16 @@ jobs:
     - name: Build Oracle Migration ISO
       run: |
         echo "🚀 Starte ISO-Build..."
-        mkdir -p $ISO_DIR
-        ISO_PATH="$ISO_DIR/OracleLinux-R9-${{ steps.detect-version.outputs.version }}-x86_64-dvd.iso"
-        export ISO_PATH
-        ./$BUILD_SCRIPT
+        export ISO_SRC="$ISO_DIR/$ISO_NAME"
+        ./build_migration_iso.sh
 
     # ------------------------------------------------------------
-    # 📦 ISO und Log hochladen
+    # 📦 Artefakte (ISO + Log) hochladen
     # ------------------------------------------------------------
     - name: Upload build artifacts
       uses: actions/upload-artifact@v4
       with:
-        name: oracle-migration-live-${{ steps.detect-version.outputs.version }}
+        name: oracle-migration-live-base
         path: |
           migration-live/oracle-migration-live.iso
           migration-live/build.log
