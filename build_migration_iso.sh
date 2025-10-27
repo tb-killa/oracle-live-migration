@@ -1,6 +1,7 @@
 #!/bin/bash
 # ===============================================================
-#  Oracle Linux Migration Live ISO Builder (UEFI + Legacy BIOS)
+#  Oracle Linux Migration Live ISO Builder
+#  (Dual Boot: UEFI + BIOS, CI-kompatibel ohne Mount)
 # ===============================================================
 set -euo pipefail
 
@@ -10,9 +11,11 @@ ISO_OUT="$WORKDIR/oracle-migration-live.iso"
 OVERLAY="$(pwd)/overlay"
 
 echo "=== Building Oracle Migration Live ISO (UEFI + BIOS) ==="
-mkdir -p "$WORKDIR/custom_iso" "$WORKDIR/mnt"
+mkdir -p "$WORKDIR/custom_iso"
 
-# Helper: run mit/ohne sudo
+# ---------------------------------------------------------------
+# Root/Sudo-kompatible Helper-Funktion
+# ---------------------------------------------------------------
 run() {
   if command -v sudo >/dev/null 2>&1; then
     sudo "$@"
@@ -22,7 +25,7 @@ run() {
 }
 
 # ---------------------------------------------------------------
-# Paketliste (für Changelog)
+# Paketliste für Changelog
 # ---------------------------------------------------------------
 {
   echo "=== Paketliste $(date -u) UTC ==="
@@ -34,21 +37,24 @@ run() {
 } > "$WORKDIR/new_pkgs.txt"
 
 # ---------------------------------------------------------------
-# Oracle ISO mounten
+# ISO extrahieren (statt mounten, da GitHub Actions kein loopdev)
 # ---------------------------------------------------------------
-echo ">>> Mount ISO: $ISO_SRC"
-if ! run mount -o loop "$ISO_SRC" "$WORKDIR/mnt" 2>/dev/null; then
-  echo "❌ Konnte Oracle ISO nicht mounten. Abbruch."
+echo ">>> Extrahiere ISO-Inhalt..."
+cd "$WORKDIR"
+if command -v 7z >/dev/null 2>&1; then
+  7z x -y -o"$WORKDIR/custom_iso" "$ISO_SRC" > /dev/null
+elif command -v bsdtar >/dev/null 2>&1; then
+  bsdtar -xf "$ISO_SRC" -C "$WORKDIR/custom_iso"
+else
+  echo "❌ Kein Entpackprogramm (7z oder bsdtar) gefunden!"
   exit 1
 fi
+cd - >/dev/null
 
 # ---------------------------------------------------------------
-# Inhalte kopieren + Bootdateien prüfen
+# Bootdateien prüfen
 # ---------------------------------------------------------------
-echo ">>> Kopiere Originaldateien..."
-rsync -a "$WORKDIR/mnt/" "$WORKDIR/custom_iso/"
-
-# Legacy BIOS-Dateien prüfen
+echo ">>> Prüfe Bootdateien..."
 if [ ! -f "$WORKDIR/custom_iso/isolinux/isolinux.bin" ]; then
   echo "❌ isolinux/isolinux.bin fehlt – Legacy Boot nicht möglich!"
   exit 1
@@ -57,17 +63,13 @@ if [ ! -f "$WORKDIR/custom_iso/isolinux/boot.cat" ]; then
   echo "❌ isolinux/boot.cat fehlt – Legacy Boot nicht möglich!"
   exit 1
 fi
-
-# UEFI-Bootdatei prüfen
 if [ ! -f "$WORKDIR/custom_iso/images/efiboot.img" ]; then
   echo "❌ images/efiboot.img fehlt – UEFI Boot nicht möglich!"
   exit 1
 fi
 
-run umount "$WORKDIR/mnt" 2>/dev/null || true
-
 # ---------------------------------------------------------------
-# Overlay anwenden (unsere Migration-GUI etc.)
+# Overlay anwenden (Migration-GUI, Tools, Services etc.)
 # ---------------------------------------------------------------
 echo ">>> Wende Overlay an..."
 rsync -a "$OVERLAY/" "$WORKDIR/custom_iso/"
@@ -80,12 +82,12 @@ if command -v mkisofs >/dev/null 2>&1; then
 elif command -v xorriso >/dev/null 2>&1; then
   ISO_CMD="xorriso -as mkisofs"
 else
-  echo "❌ Kein ISO-Erzeugungstool gefunden."
+  echo "❌ Kein ISO-Erzeugungstool (mkisofs/xorriso) gefunden."
   exit 1
 fi
 
 # ---------------------------------------------------------------
-# Bootfähiges Hybrid-ISO (UEFI + BIOS)
+# Bootfähiges Hybrid-ISO erzeugen (UEFI + BIOS)
 # ---------------------------------------------------------------
 echo ">>> Erzeuge bootfähiges Hybrid-ISO (UEFI + Legacy BIOS)..."
 $ISO_CMD -R -J -T -V "Oracle_Migration_Live" \
