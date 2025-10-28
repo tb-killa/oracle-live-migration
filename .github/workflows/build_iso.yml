@@ -22,11 +22,9 @@ jobs:
     timeout-minutes: 180
 
     steps:
-      # === 1️⃣ Repository Checkout ===
       - name: 🧾 Checkout Repository
         uses: actions/checkout@v4
 
-      # === 2️⃣ ISO Cache prüfen ===
       - name: 💾 Restore ISO Cache
         id: cache-iso
         uses: actions/cache@v4
@@ -36,7 +34,6 @@ jobs:
           restore-keys: |
             oraclelinux9u3-iso-
 
-      # === 3️⃣ ISO Download falls nicht im Cache ===
       - name: 📦 Download ISO if not cached
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
@@ -46,7 +43,6 @@ jobs:
           echo "✅ ISO erfolgreich heruntergeladen:"
           ls -lh "${ISO_DIR}/${ISO_NAME}"
 
-      # === 4️⃣ ISO prüfen ===
       - name: 🧮 Verify ISO presence
         run: |
           set -e
@@ -58,13 +54,11 @@ jobs:
           echo "✅ ISO im Cache gefunden:"
           ls -lh "${ISO_DIR}/"
 
-      # === 5️⃣ System-Tools installieren ===
       - name: 🔧 Install build dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y xorriso p7zip-full rsync dos2unix genisoimage zip unzip qemu-system-x86
 
-      # === 6️⃣ Overlay & Skripte prüfen ===
       - name: ⚙️ Validate overlay files
         run: |
           echo ">>> Prüfe Overlaystruktur..."
@@ -75,20 +69,20 @@ jobs:
           chmod +x overlay/usr/local/bin/migration-gui.sh 2>/dev/null || true
           echo "✅ Overlay geprüft und vorbereitet."
 
-      # === 7️⃣ Build-Infos sammeln (Systemstatus) ===
       - name: 🧾 Collect system info
         run: |
           mkdir -p ${BUILD_DIR}/buildinfo
-          echo "Build Timestamp: $(date -u)" > ${BUILD_DIR}/buildinfo/system.txt
-          echo "--- uname ---" >> ${BUILD_DIR}/buildinfo/system.txt
-          uname -a >> ${BUILD_DIR}/buildinfo/system.txt
-          echo "--- /etc/os-release ---" >> ${BUILD_DIR}/buildinfo/system.txt
-          cat /etc/os-release >> ${BUILD_DIR}/buildinfo/system.txt
-          echo "--- Installed DNF repos ---" >> ${BUILD_DIR}/buildinfo/system.txt
-          dpkg -l | head -n 25 >> ${BUILD_DIR}/buildinfo/system.txt
+          {
+            echo "Build Timestamp (UTC): $(date -u)"
+            echo "--- uname ---"
+            uname -a
+            echo "--- /etc/os-release ---"
+            cat /etc/os-release
+            echo "--- Installed packages (top 25) ---"
+            dpkg -l | head -n 25
+          } > ${BUILD_DIR}/buildinfo/system.txt
           echo "✅ Systeminformationen gesammelt."
 
-      # === 8️⃣ ISO aufbauen ===
       - name: 🧱 Build Oracle Migration ISO
         run: |
           set -euo pipefail
@@ -124,7 +118,6 @@ jobs:
           echo "✅ ISO erfolgreich erzeugt:"
           ls -lh "${BUILD_DIR}/${FINAL_ISO}"
 
-      # === 9️⃣ QEMU-Test (Headless Bootprüfung) ===
       - name: 🧪 Headless Boot Test
         run: |
           echo ">>> Teste Bootfähigkeit per QEMU..."
@@ -135,17 +128,71 @@ jobs:
           pkill qemu || true
           echo "✅ Boot-Test erfolgreich abgeschlossen."
 
-      # === 🔟 Artefakte bereitstellen ===
-      - name: 📤 Upload ISO & Logs
+      - name: 🔢 Checksums & Size
+        run: |
+          cd "${BUILD_DIR}"
+          sha256sum "${FINAL_ISO}" > "${FINAL_ISO}.sha256"
+          stat --printf="SIZE_BYTES=%s\n" "${FINAL_ISO}" | tee buildinfo/size.env
+          echo "ISO size & checksum:"
+          cat buildinfo/size.env
+          cat "${FINAL_ISO}.sha256"
+        shell: bash
+
+      - name: 📤 Upload full ISO as Artifact (internal)
         uses: actions/upload-artifact@v4
         with:
           name: oracle-migration-live
           path: |
             migration-live/${{ env.FINAL_ISO }}
+            migration-live/${{ env.FINAL_ISO }}.sha256
             migration-live/buildinfo/
 
-      # === 11️⃣ GitHub Release erzeugen ===
-      - name: 🚀 Create GitHub Release
+      # === Release: unter 2 GB direkt, sonst gesplittet ===
+      - name: 🪚 Split ISO for Release if > 2GB
+        id: split
+        run: |
+          set -e
+          cd "${BUILD_DIR}"
+          SIZE_BYTES=$(stat --printf="%s" "${FINAL_ISO}")
+          LIMIT=$(( 2147483648 - 10*1024*1024 ))  # ~2GB minus Sicherheitsmarge
+          if [ "${SIZE_BYTES}" -gt "${LIMIT}" ]; then
+            echo "needs_split=true" >> $GITHUB_OUTPUT
+            mkdir -p release
+            echo ">>> Erzeuge 7z-Multi-Part (1.9G pro Teil)..."
+            7z a -t7z -v1900m "release/${FINAL_ISO%.iso}.7z" "${FINAL_ISO}"
+            sha256sum "release/"* > "release/SHA256SUMS"
+            # Rejoin-Skripte
+            cat > release/rejoin.sh <<'EOS'
+#!/usr/bin/env bash
+set -euo pipefail
+PARTS=($(ls -1 *.7z.* 2>/dev/null || true))
+if [ ${#PARTS[@]} -eq 0 ]; then
+  echo "Keine Parts gefunden. Stelle sicher, dass *.7z.* im Ordner liegt."
+  exit 1
+fi
+echo ">>> Prüfe Checksums..."
+sha256sum -c SHA256SUMS || true
+echo ">>> Entpacke..."
+7z x "${PARTS[0]}"
+echo "Fertig. ISO liegt im aktuellen Ordner."
+EOS
+            chmod +x release/rejoin.sh
+            cat > release/rejoin.cmd <<'EOB'
+@echo off
+echo Verifiziere SHA256SUMS...
+for /f "tokens=1*" %%a in ('type SHA256SUMS') do @echo %%a  %%b
+echo Entpacke mit 7-Zip...
+for %%F in (*.7z.001) do (
+  "C:\Program Files\7-Zip\7z.exe" x "%%F"
+)
+echo Fertig. ISO liegt im aktuellen Ordner.
+EOB
+          else
+            echo "needs_split=false" >> $GITHUB_OUTPUT
+            echo "ISO <= 2GB, kein Split erforderlich."
+          fi
+
+      - name: 🚀 Create GitHub Release (direct or multipart)
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ github.run_number }}"
@@ -153,10 +200,7 @@ jobs:
           body_path: migration-live/buildinfo/system.txt
           files: |
             migration-live/${{ env.FINAL_ISO }}
-
-      # === 12️⃣ Abschlusstest auf Cache-Zustand ===
-      - name: ✅ Cache validation
-        run: |
-          echo ">>> ISO-Cache überprüfen..."
-          du -sh ${ISO_DIR} || true
-          echo ">>> Build abgeschlossen: $(date -u)"
+            migration-live/${{ env.FINAL_ISO }}.sha256
+            migration-live/release/**
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
