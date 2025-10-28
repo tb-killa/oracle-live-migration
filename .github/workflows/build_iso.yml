@@ -1,8 +1,8 @@
-name: 🧱 Build Oracle Migration Live ISO
+name: "🧱 Build Oracle Migration Live ISO"
 
 on:
   push:
-    branches: [ main ]
+    branches: [ "main" ]
   workflow_dispatch:
   schedule:
     - cron: "0 2 * * *"  # Täglich 02:00 UTC
@@ -17,15 +17,15 @@ env:
 
 jobs:
   build:
-    name: 🧰 Full Build Process (Cache + Overlay + ISO + Tests + Release)
+    name: "🧰 Full Build (Cache + Overlay + ISO + Test + Release)"
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
-      - name: 🧾 Checkout Repository
+      - name: "🧾 Checkout repository"
         uses: actions/checkout@v4
 
-      - name: 💾 Restore ISO Cache
+      - name: "💾 Restore ISO cache"
         id: cache-iso
         uses: actions/cache@v4
         with:
@@ -34,16 +34,17 @@ jobs:
           restore-keys: |
             oraclelinux9u3-iso-
 
-      - name: 📦 Download ISO if not cached
+      - name: "📦 Download ISO if not cached"
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
+          set -e
           mkdir -p "${ISO_DIR}"
-          echo "📦 Lade Oracle Linux 9 ISO..."
+          echo "📦 Lade Oracle Linux ISO..."
           wget -q --show-progress -O "${ISO_DIR}/${ISO_NAME}" "${ISO_URL}"
-          echo "✅ ISO erfolgreich heruntergeladen:"
+          echo "✅ ISO heruntergeladen:"
           ls -lh "${ISO_DIR}/${ISO_NAME}"
 
-      - name: 🧮 Verify ISO presence
+      - name: "🧮 Verify ISO presence"
         run: |
           set -e
           if [ ! -f "${ISO_DIR}/${ISO_NAME}" ]; then
@@ -51,27 +52,27 @@ jobs:
             ls -R "${ISO_DIR}" || true
             exit 1
           fi
-          echo "✅ ISO im Cache gefunden:"
+          echo "✅ ISO gefunden:"
           ls -lh "${ISO_DIR}/"
 
-      - name: 🔧 Install build dependencies
+      - name: "🔧 Install build dependencies"
         run: |
           sudo apt-get update -y
           sudo apt-get install -y xorriso p7zip-full rsync dos2unix genisoimage zip unzip qemu-system-x86
 
-      - name: ⚙️ Validate overlay files
+      - name: "⚙️ Normalize overlay files"
         run: |
-          echo ">>> Prüfe Overlaystruktur..."
-          find overlay -type f -print
-          echo ">>> Normalisiere Zeilenenden..."
-          find overlay -type f -name "*.sh" -exec dos2unix {} \; || true
-          echo ">>> Setze Ausführungsrechte..."
-          chmod +x overlay/usr/local/bin/migration-gui.sh 2>/dev/null || true
-          echo "✅ Overlay geprüft und vorbereitet."
+          set -e
+          if [ -d overlay ]; then
+            find overlay -type f -name "*.sh" -exec dos2unix {} \; || true
+            chmod +x overlay/usr/local/bin/migration-gui.sh 2>/dev/null || true
+          fi
+          echo "✅ Overlay normalisiert."
 
-      - name: 🧾 Collect system info
+      - name: "🧾 Collect build system info"
         run: |
-          mkdir -p ${BUILD_DIR}/buildinfo
+          set -e
+          mkdir -p "${BUILD_DIR}/buildinfo"
           {
             echo "Build Timestamp (UTC): $(date -u)"
             echo "--- uname ---"
@@ -80,10 +81,10 @@ jobs:
             cat /etc/os-release
             echo "--- Installed packages (top 25) ---"
             dpkg -l | head -n 25
-          } > ${BUILD_DIR}/buildinfo/system.txt
+          } > "${BUILD_DIR}/buildinfo/system.txt"
           echo "✅ Systeminformationen gesammelt."
 
-      - name: 🧱 Build Oracle Migration ISO
+      - name: "🧱 Build Oracle Migration ISO"
         run: |
           set -euo pipefail
           mkdir -p "${BUILD_DIR}/custom_iso"
@@ -91,20 +92,25 @@ jobs:
           7z x -y -o"${BUILD_DIR}/custom_iso" "${ISO_DIR}/${ISO_NAME}" || true
 
           echo ">>> Prüfe Bootdateien..."
-          for file in isolinux/isolinux.bin isolinux/boot.cat images/efiboot.img; do
-            [ -f "${BUILD_DIR}/custom_iso/${file}" ] || { echo "❌ Fehlende Bootdatei: ${file}"; exit 1; }
+          for file in "isolinux/isolinux.bin" "isolinux/boot.cat" "images/efiboot.img"; do
+            if [ ! -f "${BUILD_DIR}/custom_iso/${file}" ]; then
+              echo "❌ Fehlende Bootdatei: ${file}"
+              exit 1
+            fi
           done
           echo "✅ Bootdateien OK."
 
-          echo ">>> Füge Overlay hinzu..."
-          rsync -a overlay/ "${BUILD_DIR}/custom_iso/" || true
+          echo ">>> Füge Overlay hinzu (falls vorhanden)..."
+          if [ -d "overlay" ]; then
+            rsync -a overlay/ "${BUILD_DIR}/custom_iso/" || true
+          fi
 
-          echo ">>> Setze Root-Passwort..."
+          echo ">>> Setze Root-Passwort (live)..."
           echo "root:oracle" | sudo chpasswd || true
 
           echo ">>> Bereinige unnötige Inhalte..."
-          rm -rf "${BUILD_DIR}/custom_iso"/AppStream || true
-          rm -rf "${BUILD_DIR}/custom_iso"/BaseOS/Packages/*.i686.rpm || true
+          rm -rf "${BUILD_DIR}/custom_iso/AppStream" || true
+          rm -rf "${BUILD_DIR}/custom_iso/BaseOS/Packages/"*.i686.rpm || true
 
           echo ">>> Erzeuge Hybrid-ISO (UEFI + BIOS)..."
           xorriso -as mkisofs \
@@ -118,9 +124,10 @@ jobs:
           echo "✅ ISO erfolgreich erzeugt:"
           ls -lh "${BUILD_DIR}/${FINAL_ISO}"
 
-      - name: 🧪 Headless Boot Test
+      - name: "🧪 Headless boot test (QEMU)"
         run: |
-          echo ">>> Teste Bootfähigkeit per QEMU..."
+          set -e
+          echo ">>> Starte Boot-Test..."
           qemu-system-x86_64 -m 1024 -cdrom "${BUILD_DIR}/${FINAL_ISO}" -boot d \
             -display none -no-reboot -serial stdio -snapshot -nographic \
             -monitor none -vga none -net none &
@@ -128,76 +135,94 @@ jobs:
           pkill qemu || true
           echo "✅ Boot-Test erfolgreich abgeschlossen."
 
-      - name: 🔢 Checksums & Size
+      - name: "🔢 Checksums & size"
+        id: isosize
         run: |
+          set -e
           cd "${BUILD_DIR}"
           sha256sum "${FINAL_ISO}" > "${FINAL_ISO}.sha256"
-          stat --printf="SIZE_BYTES=%s\n" "${FINAL_ISO}" | tee buildinfo/size.env
+          SIZE_BYTES=$(stat --printf="%s" "${FINAL_ISO}")
+          echo "SIZE_BYTES=${SIZE_BYTES}" >> "$GITHUB_OUTPUT"
           echo "ISO size & checksum:"
-          cat buildinfo/size.env
+          echo "${SIZE_BYTES}"
           cat "${FINAL_ISO}.sha256"
-        shell: bash
 
-      - name: 📤 Upload full ISO as Artifact (internal)
+      - name: "📤 Upload full ISO as Artifact"
         uses: actions/upload-artifact@v4
         with:
-          name: oracle-migration-live
+          name: "oracle-migration-live"
           path: |
             migration-live/${{ env.FINAL_ISO }}
             migration-live/${{ env.FINAL_ISO }}.sha256
             migration-live/buildinfo/
 
-      # === Release: unter 2 GB direkt, sonst gesplittet ===
-      - name: 🪚 Split ISO for Release if > 2GB
+      - name: "🪚 Prepare multipart release if >2GB"
         id: split
         run: |
           set -e
           cd "${BUILD_DIR}"
-          SIZE_BYTES=$(stat --printf="%s" "${FINAL_ISO}")
-          LIMIT=$(( 2147483648 - 10*1024*1024 ))  # ~2GB minus Sicherheitsmarge
-          if [ "${SIZE_BYTES}" -gt "${LIMIT}" ]; then
-            echo "needs_split=true" >> $GITHUB_OUTPUT
+          LIMIT=$(( 2147483648 - 10*1024*1024 ))  # ~2GB - 10MB Puffer
+          if [ "${{ steps.isosize.outputs.SIZE_BYTES }}" -gt "${LIMIT}" ]; then
+            echo "needs_split=true" >> "$GITHUB_OUTPUT"
             mkdir -p release
-            echo ">>> Erzeuge 7z-Multi-Part (1.9G pro Teil)..."
+            echo ">>> Erzeuge 7z-Multipart (1.9G)..."
             7z a -t7z -v1900m "release/${FINAL_ISO%.iso}.7z" "${FINAL_ISO}"
-            sha256sum "release/"* > "release/SHA256SUMS"
-            # Rejoin-Skripte
-            cat > release/rejoin.sh <<'EOS'
+            sha256sum release/* > release/SHA256SUMS
+
+            # Rejoin-Skript (Linux/macOS)
+            cat > release/rejoin.sh << 'EOS'
 #!/usr/bin/env bash
 set -euo pipefail
-PARTS=($(ls -1 *.7z.* 2>/dev/null || true))
-if [ ${#PARTS[@]} -eq 0 ]; then
-  echo "Keine Parts gefunden. Stelle sicher, dass *.7z.* im Ordner liegt."
+if ! command -v 7z >/dev/null 2>&1; then
+  echo "7z (p7zip) wird benötigt."
+  exit 1
+fi
+if [ ! -f "SHA256SUMS" ]; then
+  echo "SHA256SUMS fehlt."
   exit 1
 fi
 echo ">>> Prüfe Checksums..."
 sha256sum -c SHA256SUMS || true
-echo ">>> Entpacke..."
-7z x "${PARTS[0]}"
+FIRST_PART=$(ls -1 *.7z.001 | head -n1)
+if [ -z "$FIRST_PART" ]; then
+  echo "Keine *.7z.001 gefunden."
+  exit 1
+fi
+echo ">>> Entpacke $FIRST_PART ..."
+7z x "$FIRST_PART"
 echo "Fertig. ISO liegt im aktuellen Ordner."
 EOS
             chmod +x release/rejoin.sh
-            cat > release/rejoin.cmd <<'EOB'
+
+            # Rejoin-Skript (Windows CMD)
+            cat > release/rejoin.cmd << 'EOC'
 @echo off
-echo Verifiziere SHA256SUMS...
-for /f "tokens=1*" %%a in ('type SHA256SUMS') do @echo %%a  %%b
-echo Entpacke mit 7-Zip...
+echo Prüfe, ob 7-Zip installiert ist...
+IF NOT EXIST "C:\Program Files\7-Zip\7z.exe" (
+  echo 7-Zip nicht gefunden: C:\Program Files\7-Zip\7z.exe
+  exit /b 1
+)
+echo Entpacke ersten Part (*.7z.001)...
 for %%F in (*.7z.001) do (
   "C:\Program Files\7-Zip\7z.exe" x "%%F"
+  goto :done
 )
+echo Keine *.7z.001 gefunden.
+exit /b 1
+:done
 echo Fertig. ISO liegt im aktuellen Ordner.
-EOB
+EOC
           else
-            echo "needs_split=false" >> $GITHUB_OUTPUT
-            echo "ISO <= 2GB, kein Split erforderlich."
+            echo "needs_split=false" >> "$GITHUB_OUTPUT"
+            echo "ISO <= 2GB, kein Split notwendig."
           fi
 
-      - name: 🚀 Create GitHub Release (direct or multipart)
+      - name: "🚀 Create GitHub Release (direct or multipart)"
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ github.run_number }}"
-          name: "Oracle Migration Live Build #${{ github.run_number }}"
-          body_path: migration-live/buildinfo/system.txt
+          name: "Oracle Migration Live #${{ github.run_number }}"
+          body_path: "migration-live/buildinfo/system.txt"
           files: |
             migration-live/${{ env.FINAL_ISO }}
             migration-live/${{ env.FINAL_ISO }}.sha256
