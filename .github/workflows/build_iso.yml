@@ -1,4 +1,4 @@
-name: Build, Test & Release Oracle Migration Live ISO (System Diff + Metadata + JSON)
+name: Build, Test & Release Oracle Migration Live ISO
 
 on:
   workflow_dispatch:
@@ -7,6 +7,7 @@ on:
 
 env:
   ISO_NAME: OracleLinux-R9-U3-x86_64-dvd.iso
+  ISO_URL: https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso
   ISO_DIR: ${{ github.workspace }}/migration-live
   CACHE_KEY_ISO: oraclelinux9u3-iso-cache
   RELEASE_TAG_PREFIX: nightly-
@@ -18,7 +19,7 @@ jobs:
       - name: 🧭 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 🗃️ Lade ISO Cache
+      - name: 💾 Lade ISO Cache
         id: cache_iso
         uses: actions/cache@v4
         with:
@@ -29,9 +30,8 @@ jobs:
         run: |
           mkdir -p "${ISO_DIR}"
           if [ ! -f "${ISO_DIR}/${ISO_NAME}" ]; then
-            echo "➡️ Lade ISO von Oracle..."
-            wget -q --show-progress -O "${ISO_DIR}/${ISO_NAME}" \
-              "https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/${ISO_NAME}"
+            echo "⬇️ Lade Oracle ISO von ${ISO_URL}"
+            wget -q --show-progress -O "${ISO_DIR}/${ISO_NAME}" "${ISO_URL}"
           else
             echo "✅ ISO bereits im Cache vorhanden."
           fi
@@ -69,13 +69,26 @@ jobs:
           dnf --version > "$META_DIR/dnf-version.txt"
           dnf repolist -v > "$META_DIR/dnf-repolist.txt"
 
-          # 🔧 Verschiebe ISO an den erwarteten Ort
+          # 🔍 ISO finden (Cache oder Artifact)
           mkdir -p "${{ github.workspace }}/migration-live"
-          mv "${{ github.workspace }}/cached-oracle-iso/${{ env.ISO_NAME }}" "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
+          ISO_SRC=""
+          if [ -f "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}" ]; then
+            ISO_SRC="${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
+            echo "✅ ISO gefunden (Cache: migration-live/)"
+          elif [ -f "${{ github.workspace }}/cached-oracle-iso/${{ env.ISO_NAME }}" ]; then
+            ISO_SRC="${{ github.workspace }}/cached-oracle-iso/${{ env.ISO_NAME }}"
+            echo "✅ ISO gefunden (Artifact: cached-oracle-iso/)"
+          else
+            echo "❌ ISO konnte nicht gefunden werden – zeige Struktur:"
+            ls -R "${{ github.workspace }}"
+            exit 1
+          fi
 
-          # Prüfen
+          # 📦 ISO an finalen Ort kopieren
+          cp "$ISO_SRC" "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
           ls -lh "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
 
+          # 🧮 Paketliste & ISO-Hash
           rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' | sort > "$META_DIR/rpm-list.txt"
           sha256sum "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}" > "$META_DIR/iso-sha256.txt"
 
@@ -84,8 +97,13 @@ jobs:
           set -euo pipefail
           cd "${{ github.workspace }}/migration-live"
           mkdir -p custom_iso
+          echo ">>> Extrahiere ISO-Inhalt..."
           xorriso -osirrox on -indev "${ISO_NAME}" -extract / custom_iso
-          rsync -a "${{ github.workspace }}/overlay/" custom_iso/
+          echo ">>> Wende Overlay an (falls vorhanden)..."
+          if [ -d "${{ github.workspace }}/overlay" ]; then
+            rsync -a "${{ github.workspace }}/overlay/" custom_iso/
+          fi
+          echo ">>> Erzeuge Hybrid-ISO (UEFI + BIOS)..."
           xorriso -as mkisofs -r -V "ORACLE-MIGRATION" \
             -o oracle-migration-live.iso \
             -J -joliet-long -b isolinux/isolinux.bin -c isolinux/boot.cat \
@@ -125,7 +143,7 @@ jobs:
             echo "✅ ISO bootfähig erkannt."
             kill $pid
           else
-            echo "❌ Boot fehlgeschlagen!"
+            echo "❌ Boot-Test fehlgeschlagen!"
             exit 1
           fi
 
@@ -142,8 +160,8 @@ jobs:
           name: build-output
           path: release_payload
 
-      - name: 🧮 Analysiere Paketänderungen (Markdown & JSON)
-        id: rpm_diff
+      - name: 🧮 Analysiere Paketänderungen
+        id: diff
         run: |
           mkdir -p release_payload/diff
           echo "🔍 Prüfe vorheriges Release..."
@@ -159,7 +177,6 @@ jobs:
           if [ -f "$OLD_FILE" ]; then
             diff -u "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff.txt || true
 
-            # Markdown
             awk '
               /^+/ && !/^\+\+/ {sub(/^\+/, "", $0); add[$1]=$0}
               /^-/ && !/^--/   {sub(/^-/, "", $0); rem[$1]=$0}
@@ -173,11 +190,8 @@ jobs:
               }
             ' "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff-summary.md
 
-            # JSON
-            jq -n --arg new "$(sha256sum $NEW_FILE | awk '{print $1}')" \
-                  --arg old "$(sha256sum $OLD_FILE | awk '{print $1}')" \
-                  --argfile diff <(diff -u "$OLD_FILE" "$NEW_FILE" | jq -R -s 'split("\n")') \
-                  '{old_sha:$old,new_sha:$new,diff:$diff}' > release_payload/diff/rpm-diff.json
+            jq -n --argfile diff <(diff -u "$OLD_FILE" "$NEW_FILE" | jq -R -s 'split("\n")') \
+                  '{changes:$diff}' > release_payload/diff/rpm-diff.json
           else
             echo "_Initialer Build – kein Vergleich verfügbar._" > release_payload/diff/rpm-diff-summary.md
             jq -n '{"note":"Initialer Build, kein Vergleich verfügbar"}' > release_payload/diff/rpm-diff.json
@@ -185,7 +199,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 🏷️ Erstelle Release mit System-Infos & Paket-Diff
+      - name: 🏷️ Erstelle Release mit System-Infos
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ env.RELEASE_TAG_PREFIX }}${{ github.run_number }}
@@ -199,11 +213,8 @@ jobs:
             - DNF-Version: $(head -n 1 release_payload/buildinfo/dnf-version.txt)
             - ISO SHA256: $(awk '{print $1}' release_payload/buildinfo/built-iso-sha256.txt)
 
-            ### 📦 Paketänderungen (vollständige Übersicht)
+            ### 📦 Paketänderungen
             $(cat release_payload/diff/rpm-diff-summary.md)
-
-            ---
-            _Vollständige Listen, JSON-Diff & ISO befinden sich in den Release-Assets._
           files: |
             release_payload/oracle-migration-live.iso
             release_payload/buildinfo/**
