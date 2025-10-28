@@ -10,7 +10,6 @@ env:
   ISO_DIR: ${{ github.workspace }}/migration-live
   CACHE_KEY_ISO: oraclelinux9u3-iso-cache
   CACHE_KEY_EXTRACT: oraclelinux9u3-extracted-cache
-  BUILD_OUTPUT: /__w/${{ github.repository }}/migration-live/oracle-migration-live.iso
   RELEASE_TAG_PREFIX: nightly-
 
 jobs:
@@ -48,14 +47,13 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     container:
-      image: oraclelinux:9
-      options: --volume "/__w:/__w"
+      image: oraclelinux:9  # kein zusätzliches volume mount mehr
     steps:
       - name: 🔽 Lade Artefakte
         uses: actions/download-artifact@v4
         with:
           name: cached-oracle-iso
-          path: /__w/${{ github.repository }}/migration-live
+          path: ${{ github.workspace }}/migration-live
 
       - name: ⚙️ Installiere Build-Abhängigkeiten
         run: |
@@ -65,22 +63,22 @@ jobs:
       - name: 🧾 Erfasse System-Metadaten
         run: |
           set -euo pipefail
-          META_DIR="/__w/${{ github.repository }}/migration-live/buildinfo"
+          META_DIR="${{ github.workspace }}/migration-live/buildinfo"
           mkdir -p "$META_DIR"
           cat /etc/os-release > "$META_DIR/os-release.txt"
           uname -a > "$META_DIR/uname.txt"
           dnf --version > "$META_DIR/dnf-version.txt"
           dnf repolist -v > "$META_DIR/dnf-repolist.txt"
           rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' | sort > "$META_DIR/rpm-list.txt"
-          sha256sum /__w/${{ github.repository }}/migration-live/${{ env.ISO_NAME }} > "$META_DIR/iso-sha256.txt"
+          sha256sum "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}" > "$META_DIR/iso-sha256.txt"
 
       - name: 🚀 Starte ISO-Build
         run: |
           set -euo pipefail
-          cd /__w/${{ github.repository }}/migration-live
+          cd "${{ github.workspace }}/migration-live"
           mkdir -p custom_iso
           xorriso -osirrox on -indev "${ISO_NAME}" -extract / custom_iso
-          rsync -a /__w/${{ github.repository }}/overlay/ custom_iso/
+          rsync -a "${{ github.workspace }}/overlay/" custom_iso/
           xorriso -as mkisofs -r -V "ORACLE-MIGRATION" \
             -o oracle-migration-live.iso \
             -J -joliet-long -b isolinux/isolinux.bin -c isolinux/boot.cat \
@@ -93,8 +91,8 @@ jobs:
         with:
           name: build-output
           path: |
-            /__w/${{ github.repository }}/migration-live/oracle-migration-live.iso
-            /__w/${{ github.repository }}/migration-live/buildinfo/
+            ${{ github.workspace }}/migration-live/oracle-migration-live.iso
+            ${{ github.workspace }}/migration-live/buildinfo/
 
   test:
     needs: build
@@ -147,14 +145,10 @@ jobs:
           if [ -n "$LATEST" ]; then
             gh release download "$LATEST" -p "buildinfo/rpm-list.txt" -D prev_release || true
             if [ -f "prev_release/buildinfo/rpm-list.txt" ]; then
-              echo "🔄 Erstelle farbliche Paketvergleichsausgabe..."
               NEW_FILE="release_payload/buildinfo/rpm-list.txt"
               OLD_FILE="prev_release/buildinfo/rpm-list.txt"
-
-              # Diff ermitteln
               diff -u "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff.txt || true
 
-              # Neu / Entfernt / Geändert ermitteln
               awk '
                 /^+/ && !/^\+\+/ {sub(/^\+/, "", $0); add[$1]=$0}
                 /^-/ && !/^--/   {sub(/^-/, "", $0); rem[$1]=$0}
@@ -167,14 +161,10 @@ jobs:
                   for (i in add) if (i in rem && add[i] != rem[i]) print "  ~ " add[i] " ← " rem[i]
                 }
               ' "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff-summary.md
-
-              echo "✅ Farbliche Paketänderungen erstellt."
             else
-              echo "⚠️ Keine vorherige RPM-Liste gefunden."
               echo "_Erster Build – kein Vergleich möglich._" > release_payload/diff/rpm-diff-summary.md
             fi
           else
-            echo "⚠️ Kein vorheriges Release gefunden."
             echo "_Initialer Build – kein Vergleich verfügbar._" > release_payload/diff/rpm-diff-summary.md
           fi
         env:
