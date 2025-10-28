@@ -105,35 +105,35 @@ jobs:
         echo "=== Füge RAID-Autoload (systemd) hinzu ==="
         install -d "$CUSTOM/usr/local/sbin"
         cat > "$CUSTOM/usr/local/sbin/raid-modprobe.sh" <<'EOS'
-#!/bin/bash
-set -e
-echo "[INIT] Lade RAID/DM-Module..."
-mods=(dm_mod md_mod raid0 raid1 raid10 raid456)
-for mod in "${mods[@]}"; do
-  if ! /usr/sbin/modprobe "$mod"; then
-    echo "[WARN] Modul $mod konnte nicht geladen werden." >&2
-  fi
-done
-exit 0
-EOS
+        #!/bin/bash
+        set -e
+        echo "[INIT] Lade RAID/DM-Module..."
+        mods=(dm_mod md_mod raid0 raid1 raid10 raid456)
+        for mod in "${mods[@]}"; do
+          if ! /usr/sbin/modprobe "$mod"; then
+            echo "[WARN] Modul $mod konnte nicht geladen werden." >&2
+          fi
+        done
+        exit 0
+        EOS
         chmod +x "$CUSTOM/usr/local/sbin/raid-modprobe.sh"
 
         install -d "$CUSTOM/etc/systemd/system"
         cat > "$CUSTOM/etc/systemd/system/raid-modprobe.service" <<'EOS'
-[Unit]
-Description=Load RAID and Device Mapper modules at boot
-DefaultDependencies=no
-After=systemd-modules-load.service
-Before=multi-user.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/raid-modprobe.sh
-RemainAfterExit=yes
-
-[Install]
-WantedBy=multi-user.target
-EOS
+        [Unit]
+        Description=Load RAID and Device Mapper modules at boot
+        DefaultDependencies=no
+        After=systemd-modules-load.service
+        Before=multi-user.target
+        
+        [Service]
+        Type=oneshot
+        ExecStart=/usr/local/sbin/raid-modprobe.sh
+        RemainAfterExit=yes
+        
+        [Install]
+        WantedBy=multi-user.target
+        EOS
         install -d "$CUSTOM/etc/systemd/system/multi-user.target.wants"
         ln -sf /etc/systemd/system/raid-modprobe.service \
           "$CUSTOM/etc/systemd/system/multi-user.target.wants/raid-modprobe.service"
