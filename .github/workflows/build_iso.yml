@@ -1,4 +1,4 @@
-name: Build, Test & Release Oracle Migration Live ISO (System Diff & Metadata)
+name: Build, Test & Release Oracle Migration Live ISO (System Diff + Metadata + JSON)
 
 on:
   workflow_dispatch:
@@ -9,7 +9,6 @@ env:
   ISO_NAME: OracleLinux-R9-U3-x86_64-dvd.iso
   ISO_DIR: ${{ github.workspace }}/migration-live
   CACHE_KEY_ISO: oraclelinux9u3-iso-cache
-  CACHE_KEY_EXTRACT: oraclelinux9u3-extracted-cache
   RELEASE_TAG_PREFIX: nightly-
 
 jobs:
@@ -47,13 +46,13 @@ jobs:
     needs: prepare
     runs-on: ubuntu-latest
     container:
-      image: oraclelinux:9  # kein zusätzliches volume mount mehr
+      image: oraclelinux:9
     steps:
       - name: 🔽 Lade Artefakte
         uses: actions/download-artifact@v4
         with:
           name: cached-oracle-iso
-          path: ${{ github.workspace }}/migration-live
+          path: ${{ github.workspace }}/cached-oracle-iso
 
       - name: ⚙️ Installiere Build-Abhängigkeiten
         run: |
@@ -69,6 +68,14 @@ jobs:
           uname -a > "$META_DIR/uname.txt"
           dnf --version > "$META_DIR/dnf-version.txt"
           dnf repolist -v > "$META_DIR/dnf-repolist.txt"
+
+          # 🔧 Verschiebe ISO an den erwarteten Ort
+          mkdir -p "${{ github.workspace }}/migration-live"
+          mv "${{ github.workspace }}/cached-oracle-iso/${{ env.ISO_NAME }}" "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
+
+          # Prüfen
+          ls -lh "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
+
           rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' | sort > "$META_DIR/rpm-list.txt"
           sha256sum "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}" > "$META_DIR/iso-sha256.txt"
 
@@ -135,37 +142,45 @@ jobs:
           name: build-output
           path: release_payload
 
-      - name: 🧮 Analysiere Paketänderungen (farblich & gruppiert)
+      - name: 🧮 Analysiere Paketänderungen (Markdown & JSON)
         id: rpm_diff
         run: |
           mkdir -p release_payload/diff
           echo "🔍 Prüfe vorheriges Release..."
           LATEST=$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)
           echo "Letztes Release: $LATEST"
+
+          NEW_FILE="release_payload/buildinfo/rpm-list.txt"
           if [ -n "$LATEST" ]; then
             gh release download "$LATEST" -p "buildinfo/rpm-list.txt" -D prev_release || true
-            if [ -f "prev_release/buildinfo/rpm-list.txt" ]; then
-              NEW_FILE="release_payload/buildinfo/rpm-list.txt"
-              OLD_FILE="prev_release/buildinfo/rpm-list.txt"
-              diff -u "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff.txt || true
+          fi
+          OLD_FILE="prev_release/buildinfo/rpm-list.txt"
 
-              awk '
-                /^+/ && !/^\+\+/ {sub(/^\+/, "", $0); add[$1]=$0}
-                /^-/ && !/^--/   {sub(/^-/, "", $0); rem[$1]=$0}
-                END {
-                  print "🟢 **Neu hinzugefügt:**"
-                  for (i in add) if (!(i in rem)) print "  + " add[i]
-                  print "\n🔴 **Entfernt:**"
-                  for (i in rem) if (!(i in add)) print "  - " rem[i]
-                  print "\n🔵 **Aktualisiert:**"
-                  for (i in add) if (i in rem && add[i] != rem[i]) print "  ~ " add[i] " ← " rem[i]
-                }
-              ' "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff-summary.md
-            else
-              echo "_Erster Build – kein Vergleich möglich._" > release_payload/diff/rpm-diff-summary.md
-            fi
+          if [ -f "$OLD_FILE" ]; then
+            diff -u "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff.txt || true
+
+            # Markdown
+            awk '
+              /^+/ && !/^\+\+/ {sub(/^\+/, "", $0); add[$1]=$0}
+              /^-/ && !/^--/   {sub(/^-/, "", $0); rem[$1]=$0}
+              END {
+                print "🟢 **Neu hinzugefügt:**"
+                for (i in add) if (!(i in rem)) print "  + " add[i]
+                print "\n🔴 **Entfernt:**"
+                for (i in rem) if (!(i in add)) print "  - " rem[i]
+                print "\n🔵 **Aktualisiert:**"
+                for (i in add) if (i in rem && add[i] != rem[i]) print "  ~ " add[i] " ← " rem[i]
+              }
+            ' "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff-summary.md
+
+            # JSON
+            jq -n --arg new "$(sha256sum $NEW_FILE | awk '{print $1}')" \
+                  --arg old "$(sha256sum $OLD_FILE | awk '{print $1}')" \
+                  --argfile diff <(diff -u "$OLD_FILE" "$NEW_FILE" | jq -R -s 'split("\n")') \
+                  '{old_sha:$old,new_sha:$new,diff:$diff}' > release_payload/diff/rpm-diff.json
           else
             echo "_Initialer Build – kein Vergleich verfügbar._" > release_payload/diff/rpm-diff-summary.md
+            jq -n '{"note":"Initialer Build, kein Vergleich verfügbar"}' > release_payload/diff/rpm-diff.json
           fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -188,11 +203,12 @@ jobs:
             $(cat release_payload/diff/rpm-diff-summary.md)
 
             ---
-            _Vollständige Listen & ISO befinden sich in den Release-Assets._
+            _Vollständige Listen, JSON-Diff & ISO befinden sich in den Release-Assets._
           files: |
             release_payload/oracle-migration-live.iso
             release_payload/buildinfo/**
             release_payload/diff/rpm-diff.txt
             release_payload/diff/rpm-diff-summary.md
+            release_payload/diff/rpm-diff.json
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
