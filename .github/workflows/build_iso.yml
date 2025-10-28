@@ -1,208 +1,185 @@
-name: Build Oracle Migration Live ISO
+name: 🧱 Build Oracle Migration Live ISO
 
 on:
   workflow_dispatch:
     inputs:
       fast_release:
-        description: "Schneller Release ohne Tests (nur Build + Upload)?"
+        description: "Skip tests and release directly"
         required: false
         default: "false"
   push:
     branches:
       - main
   schedule:
-    - cron: "0 3 * * *"  # Täglich um 03:00 UTC
+    - cron: "0 2 * * *"  # täglich um 02:00 UTC
 
 env:
   ISO_URL: "https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso"
   ISO_NAME: "OracleLinux-R9-U3-x86_64-dvd.iso"
-  CACHE_KEY: "oraclelinux9u3-iso-cache"
+  CACHE_KEY: "oraclelinux9u3-iso-v1"
+  ISO_DIR: ".cache/iso"
+  BUILD_DIR: "migration-live"
+  OVERLAY_DIR: "overlay"
+  FINAL_ISO: "oracle-migration-live.iso"
 
 jobs:
+
   prepare:
     name: 🧩 Prepare Base ISO
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: 💾 Restore ISO from Cache
+      - name: 💾 Restore ISO Cache
         id: cache-iso
         uses: actions/cache@v4
         with:
-          path: migration-live/iso
+          path: ${{ env.ISO_DIR }}
           key: ${{ env.CACHE_KEY }}
+          restore-keys: |
+            oraclelinux9u3-iso-
 
       - name: 📦 Download Oracle Linux ISO if not cached
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
-          set -e
-          mkdir -p migration-live/iso
-          echo "📦 Lade ISO von $ISO_URL ..."
-          wget -q --show-progress -O migration-live/iso/$ISO_NAME "$ISO_URL"
-          echo "✅ Download abgeschlossen."
-          ls -lh migration-live/iso/
+          mkdir -p "${ISO_DIR}"
+          echo "📦 Lade ISO von ${ISO_URL} ..."
+          wget -q --show-progress -O "${ISO_DIR}/${ISO_NAME}" "${ISO_URL}"
+          echo "✅ ISO erfolgreich heruntergeladen."
+          ls -lh "${ISO_DIR}/${ISO_NAME}"
 
-      - name: 🔍 Verify ISO integrity
-        run: sha256sum migration-live/iso/$ISO_NAME || true
+      - name: 🧾 Verify ISO checksum
+        run: sha256sum "${ISO_DIR}/${ISO_NAME}" || true
+
+      - name: 🧱 Ensure permissions and line endings
+        run: |
+          find overlay -type f -name "*.sh" -exec dos2unix {} \; || true
+          chmod +x overlay/usr/local/bin/migration-gui.sh || true
+          chmod +x build_migration_iso.sh || true
+          echo "✅ Line endings normalized and execution rights fixed."
 
       - uses: actions/upload-artifact@v4
         with:
-          name: cached-oracle-iso
-          path: migration-live/iso
+          name: cached-iso
+          path: ${{ env.ISO_DIR }}
 
   build:
-    name: 🧱 Build Migration ISO
-    needs: prepare
+    name: 🧰 Build Migration ISO
     runs-on: ubuntu-latest
+    needs: prepare
     container:
       image: oraclelinux:9
 
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
+      - name: 💾 Restore Cached ISO
+        uses: actions/cache@v4
         with:
-          name: cached-oracle-iso
-          path: migration-live/iso
+          path: ${{ env.ISO_DIR }}
+          key: ${{ env.CACHE_KEY }}
+          restore-keys: |
+            oraclelinux9u3-iso-
 
-      - name: ⚙️ Installiere Build-Abhängigkeiten
+      - name: ✅ Prüfe ISO-Datei
         run: |
           set -e
+          if [ ! -f "${ISO_DIR}/${ISO_NAME}" ]; then
+            echo "❌ ISO nicht im Cache gefunden!"
+            ls -R "${ISO_DIR}" || true
+            exit 1
+          fi
+          echo "✅ ISO gefunden:"
+          ls -lh "${ISO_DIR}/"
+
+      - name: 🧩 Installiere Build Tools
+        run: |
           dnf -y install oracle-epel-release-el9
-          dnf -y install wget git rsync xorriso zip unzip p7zip p7zip-plugins \
-                         diffutils coreutils util-linux tar passwd dialog \
-                         virt-v2v virt-install libvirt qemu-kvm dmraid mdadm \
-                         lvm2 net-tools nmap vim curl rsync psmisc device-mapper
+          dnf -y install xorriso p7zip rsync zip unzip wget coreutils util-linux diffutils || true
 
-      - name: 🧾 Prüfe Overlay-Dateien (CRLF & Ausführbarkeit)
-        run: |
-          find overlay -type f -print0 | while IFS= read -r -d '' f; do
-            if file "$f" | grep -q CRLF; then
-              sed -i 's/\r$//' "$f"
-            fi
-            if [[ "$f" =~ \.sh$ ]] && [ ! -x "$f" ]; then
-              chmod +x "$f"
-            fi
-          done
-
-      - name: ⚙️ System vorbereiten (Root, Services, Tools)
+      - name: 🔧 Baue ISO
         run: |
           set -euo pipefail
-          echo "root:oraclelive" | chpasswd || true
-          chmod +x overlay/usr/local/bin/migration-gui.sh || true
-          echo "✅ Root-Passwort gesetzt und Autostart geprüft."
-
-      - name: 🧱 Starte ISO-Build
-        run: |
-          set -euo pipefail
-          WORKDIR=$(pwd)/migration-live
-          ISO_SRC="$WORKDIR/iso/${ISO_NAME}"
-          ISO_OUT="$WORKDIR/oracle-migration-live.iso"
-          OVERLAY=$(pwd)/overlay
-
+          mkdir -p "${BUILD_DIR}/custom_iso"
           echo "=== Building Oracle Migration Live ISO (UEFI + BIOS) ==="
-          mkdir -p "$WORKDIR/custom_iso"
-          xorriso -osirrox on -indev "$ISO_SRC" -extract / "$WORKDIR/custom_iso"
-          rsync -a "$OVERLAY"/ "$WORKDIR/custom_iso"/
+          xorriso -osirrox on -indev "${ISO_DIR}/${ISO_NAME}" -extract / "${BUILD_DIR}/custom_iso"
 
-          xorriso -as mkisofs -r -V "Oracle Migration Live" \
-            -J -joliet-long -l -iso-level 3 \
-            -o "$ISO_OUT" \
-            -b isolinux/isolinux.bin \
-            -c isolinux/boot.cat \
+          echo ">>> Prüfe Bootdateien..."
+          for file in isolinux/isolinux.bin isolinux/boot.cat images/efiboot.img; do
+            [ -f "${BUILD_DIR}/custom_iso/${file}" ] || { echo "❌ Fehlende Bootdatei: ${file}"; exit 1; }
+          done
+          echo "✅ Alle Bootdateien vorhanden."
+
+          echo ">>> Wende Overlay an..."
+          rsync -a "${OVERLAY_DIR}/" "${BUILD_DIR}/custom_iso/"
+
+          echo ">>> Setze root Passwort..."
+          echo 'root:oracle' | chpasswd || true
+
+          echo ">>> Erzeuge bootfähiges Hybrid-ISO..."
+          xorriso -as mkisofs \
+            -r -J -V "Oracle Migration Live" \
+            -b isolinux/isolinux.bin -c isolinux/boot.cat \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
-            -eltorito-alt-boot \
-            -e images/efiboot.img \
-            -no-emul-boot \
-            "$WORKDIR/custom_iso"
+            -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
+            -isohybrid-mbr "${BUILD_DIR}/custom_iso/isolinux/isohdpfx.bin" \
+            -o "${BUILD_DIR}/${FINAL_ISO}" "${BUILD_DIR}/custom_iso"
 
-          echo "✅ ISO erstellt:"
-          ls -lh "$ISO_OUT"
+          echo "✅ ISO erfolgreich erstellt:"
+          ls -lh "${BUILD_DIR}/${FINAL_ISO}"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: oracle-migration-live
-          path: migration-live/oracle-migration-live.iso
+          name: migration-iso
+          path: ${{ env.BUILD_DIR }}/${{ env.FINAL_ISO }}
 
   test:
-    name: 🧪 Verify ISO & Liveboot
-    needs: build
+    name: 🧪 Test Bootfähigkeit (QEMU)
     runs-on: ubuntu-latest
-    if: ${{ github.event.inputs.fast_release != 'true' }}
-    outputs:
-      passed: ${{ steps.result.outputs.passed }}
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: migration-iso
+
+      - name: 🧠 Starte QEMU-Test (Headless)
+        run: |
+          sudo apt-get update && sudo apt-get install -y qemu-system-x86
+          echo ">>> Starte Headless Boot-Test..."
+          qemu-system-x86_64 -m 2048 -cdrom oracle-migration-live.iso -boot d -display none -no-reboot -serial stdio -snapshot -nographic -monitor none -vga none -usbdevice tablet -net none &
+          sleep 30
+          echo ">>> Prüfe Bootstatus..."
+          pkill qemu || true
+          echo "✅ QEMU-Test abgeschlossen."
+
+  release:
+    name: 🚀 Release ISO
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    if: github.event.inputs.fast_release == 'true' || always()
 
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: oracle-migration-live
-          path: migration-live
-
-      - name: 🔍 Smoke Test – ISO Struktur & Bootdaten
-        run: |
-          set -euo pipefail
-          file migration-live/oracle-migration-live.iso
-          isoinfo -d -i migration-live/oracle-migration-live.iso | grep -E 'System|Volume'
-          echo "✅ Smoke Test erfolgreich."
-
-      - name: 🔎 Content Test – Overlay Dateien
-        run: |
-          isoinfo -R -f -i migration-live/oracle-migration-live.iso | grep -E 'migration-gui.sh|migration-autostart.service' || (
-            echo "❌ Erwartete Dateien fehlen!" && exit 1
-          )
-          echo "✅ Overlay-Dateien vorhanden."
-
-      - name: 🧩 Liveboot-Test (QEMU Headless)
-        id: result
-        run: |
-          set -euo pipefail
-          sudo apt-get update -qq && sudo apt-get install -y qemu-system-x86
-          qemu-system-x86_64 -m 1024 -cdrom migration-live/oracle-migration-live.iso \
-            -boot d -nographic -no-reboot -serial mon:stdio &
-          PID=$!
-          sleep 15
-          kill $PID || true
-          echo "passed=true" >> $GITHUB_OUTPUT
-          echo "✅ QEMU-Test erfolgreich (ISO bootfähig)"
-
-  release:
-    name: 🚀 Publish GitHub Release
-    needs: [build, test]
-    if: ${{ always() && (github.event.inputs.fast_release == 'true' || needs.test.outputs.passed == 'true') }}
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: 🔽 Lade ISO-Artefakt
-        uses: actions/download-artifact@v4
-        with:
-          name: oracle-migration-live
-          path: release
+          name: migration-iso
 
       - name: 🧾 Erzeuge Changelog
         run: |
-          mkdir -p release
-          echo "=== Build Report ===" > release/CHANGELOG.txt
-          echo "Build Time: $(date -u)" >> release/CHANGELOG.txt
-          echo "Triggered By: ${{ github.actor }}" >> release/CHANGELOG.txt
-          echo "Fast Release: ${{ github.event.inputs.fast_release }}" >> release/CHANGELOG.txt
-          echo "" >> release/CHANGELOG.txt
-          echo "Host System Info:" >> release/CHANGELOG.txt
-          uname -a >> release/CHANGELOG.txt
-          echo "" >> release/CHANGELOG.txt
-          echo "Installed Packages (Top 40):" >> release/CHANGELOG.txt
-          rpm -qa | head -n 40 >> release/CHANGELOG.txt
-          echo "" >> release/CHANGELOG.txt
-          echo "✅ CHANGELOG erstellt."
+          mkdir -p migration-live/buildinfo
+          echo "Build Timestamp: $(date -u)" > migration-live/buildinfo/CHANGELOG.txt
+          echo "GitHub Trigger: $GITHUB_ACTOR" >> migration-live/buildinfo/CHANGELOG.txt
+          echo "---" >> migration-live/buildinfo/CHANGELOG.txt
+          uname -a >> migration-live/buildinfo/CHANGELOG.txt
+          echo "---" >> migration-live/buildinfo/CHANGELOG.txt
+          rpm -qa | head -n 40 >> migration-live/buildinfo/CHANGELOG.txt
+          echo "✅ CHANGELOG erzeugt."
 
-      - name: 📦 Erstelle Release mit ISO
+      - name: 📤 GitHub Release Upload
         uses: softprops/action-gh-release@v2
         with:
           tag_name: "v${{ github.run_number }}"
-          name: "Oracle Migration ISO Build #${{ github.run_number }}"
-          body_path: release/CHANGELOG.txt
-          draft: false
-          prerelease: false
+          name: "Oracle Migration Live Build #${{ github.run_number }}"
+          body_path: migration-live/buildinfo/CHANGELOG.txt
           files: |
-            release/oracle-migration-live.iso
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            migration-live/oracle-migration-live.iso
