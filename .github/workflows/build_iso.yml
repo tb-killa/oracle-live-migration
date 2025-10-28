@@ -98,13 +98,13 @@ jobs:
         echo "=== Aktiviere RAID-Module beim Boot ==="
         mkdir -p "$WORKDIR/custom_iso/etc"
         cat <<'EOF' > "$WORKDIR/custom_iso/etc/rc.d/rc.local"
-#!/bin/bash
-echo "[INIT] Lade RAID-Module..."
-for mod in dm_mod md_mod raid0 raid1 raid10 raid456; do
-  modprobe $mod || echo "[WARN] Modul $mod konnte nicht geladen werden."
-done
-exit 0
-EOF
+        #!/bin/bash
+        echo "[INIT] Lade RAID-Module..."
+        for mod in dm_mod md_mod raid0 raid1 raid10 raid456; do
+          modprobe $mod || echo "[WARN] Modul $mod konnte nicht geladen werden."
+        done
+        exit 0
+        EOF
         chmod +x "$WORKDIR/custom_iso/etc/rc.d/rc.local"
 
         echo "=== Bereinige unnötige Inhalte ==="
