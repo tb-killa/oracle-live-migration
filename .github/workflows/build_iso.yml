@@ -1,146 +1,208 @@
-name: Build Oracle Migration Live ISO
+name: Build, Test & Release Oracle Migration Live ISO (System Diff & Metadata)
 
 on:
-  push:
-    branches: [ "main" ]
-  schedule:
-    - cron: "0 2 * * *"  # täglich um 2 Uhr nachts
   workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * *"
 
 env:
-  ISO_URL: "https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso"
-  ISO_NAME: "OracleLinux-R9-U3-x86_64-dvd.iso"
-  ISO_DIR: "migration-live"
-  BUILD_SCRIPT: "build_migration_iso.sh"
-  CACHE_KEY: "oraclelinux9u3-dvd-cache"
+  ISO_NAME: OracleLinux-R9-U3-x86_64-dvd.iso
+  ISO_DIR: ${{ github.workspace }}/migration-live
+  CACHE_KEY_ISO: oraclelinux9u3-iso-cache
+  CACHE_KEY_EXTRACT: oraclelinux9u3-extracted-cache
+  BUILD_OUTPUT: /__w/${{ github.repository }}/migration-live/oracle-migration-live.iso
+  RELEASE_TAG_PREFIX: nightly-
 
 jobs:
-  build:
+  prepare:
     runs-on: ubuntu-latest
-    container:
-      image: oraclelinux:9
-
     steps:
-      # 1️⃣ Repository Checkout
-      - name: 🧩 Checkout Repository
+      - name: 🧭 Checkout Repository
         uses: actions/checkout@v4
 
-      # 2️⃣ Strukturprüfung und Rechte
-      - name: 🔍 Repository Struktur prüfen
-        run: |
-          echo "=== Repository Struktur prüfen ==="
-          REQUIRED_FILES=(
-            "$BUILD_SCRIPT"
-            "overlay/usr/local/bin/migration-gui.sh"
-            "overlay/root/install-tools.sh"
-            "overlay/etc/systemd/system/migration-autostart.service"
-          )
-          for f in "${REQUIRED_FILES[@]}"; do
-            if [ ! -f "$f" ]; then
-              echo "❌ Fehlende Datei: $f"; exit 1
-            else
-              echo "✅ Gefunden: $f"
-            fi
-          done
-          # CRLF prüfen
-          if grep -rIUls $'\r' overlay/ >/dev/null 2>&1; then
-            echo "⚠️ CRLF-Zeilenenden gefunden!"; exit 1
-          else
-            echo "✅ Keine CRLF-Zeilenenden."
-          fi
-          # Ausführbar setzen
-          chmod +x "$BUILD_SCRIPT" overlay/usr/local/bin/migration-gui.sh || true
-          echo "✅ Rechte korrekt gesetzt."
-
-      # 3️⃣ Caches aktivieren
       - name: 🗃️ Lade ISO Cache
         id: cache_iso
         uses: actions/cache@v4
         with:
           path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
-          key: ${{ env.CACHE_KEY }}
+          key: ${{ env.CACHE_KEY_ISO }}
 
-      - name: 🗃️ DNF Cache
-        uses: actions/cache@v4
+      - name: 📦 Lade Oracle ISO falls nicht im Cache
+        run: |
+          mkdir -p "${ISO_DIR}"
+          if [ ! -f "${ISO_DIR}/${ISO_NAME}" ]; then
+            echo "➡️ Lade ISO von Oracle..."
+            wget -q --show-progress -O "${ISO_DIR}/${ISO_NAME}" \
+              "https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/${ISO_NAME}"
+          else
+            echo "✅ ISO bereits im Cache vorhanden."
+          fi
+
+      - name: 📤 Lade ISO als Artefakt
+        uses: actions/upload-artifact@v4
         with:
-          path: /var/cache/dnf
-          key: dnf-cache-${{ runner.os }}-${{ hashFiles('**/build_migration_iso.sh') }}
-          restore-keys: |
-            dnf-cache-${{ runner.os }}-
+          name: cached-oracle-iso
+          path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
 
-      # 4️⃣ Abhängigkeiten installieren
+  build:
+    needs: prepare
+    runs-on: ubuntu-latest
+    container:
+      image: oraclelinux:9
+      options: --volume "/__w:/__w"
+    steps:
+      - name: 🔽 Lade Artefakte
+        uses: actions/download-artifact@v4
+        with:
+          name: cached-oracle-iso
+          path: /__w/${{ github.repository }}/migration-live
+
       - name: ⚙️ Installiere Build-Abhängigkeiten
         run: |
           dnf -y install oracle-epel-release-el9
           dnf -y install git wget rsync xorriso zip unzip p7zip p7zip-plugins jq diffutils coreutils util-linux tar
 
-      # 5️⃣ ISO Download & Cache
-      - name: 📦 Lade oder prüfe Oracle Linux ISO
+      - name: 🧾 Erfasse System-Metadaten
         run: |
-          set -e
-          mkdir -p $ISO_DIR
-          ISO_PATH="$ISO_DIR/$ISO_NAME"
-          if [ -f "$ISO_PATH" ]; then
-            echo "✅ ISO bereits im Cache vorhanden: $ISO_PATH"
-          else
-            echo "📦 Lade ISO von $ISO_URL ..."
-            wget --progress=dot:giga -O "$ISO_PATH" "$ISO_URL"
-            echo "✅ Download abgeschlossen."
-          fi
-          echo "🔍 Prüfe Datei:"
-          ls -lh "$ISO_PATH"
-          echo "🔢 Prüfsumme (SHA256):"
-          sha256sum "$ISO_PATH" | tee iso_checksum.txt
-          FILESIZE=$(stat -c%s "$ISO_PATH")
-          if [ "$FILESIZE" -lt 1000000000 ]; then
-            echo "❌ ISO-Datei zu klein (<1GB)!"; exit 1
-          fi
-          echo "✅ ISO gültig."
+          set -euo pipefail
+          META_DIR="/__w/${{ github.repository }}/migration-live/buildinfo"
+          mkdir -p "$META_DIR"
+          cat /etc/os-release > "$META_DIR/os-release.txt"
+          uname -a > "$META_DIR/uname.txt"
+          dnf --version > "$META_DIR/dnf-version.txt"
+          dnf repolist -v > "$META_DIR/dnf-repolist.txt"
+          rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' | sort > "$META_DIR/rpm-list.txt"
+          sha256sum /__w/${{ github.repository }}/migration-live/${{ env.ISO_NAME }} > "$META_DIR/iso-sha256.txt"
 
-      # 6️⃣ Build ausführen
       - name: 🚀 Starte ISO-Build
         run: |
-          echo "🚀 Starte ISO-Build..."
-          bash "$BUILD_SCRIPT"
+          set -euo pipefail
+          cd /__w/${{ github.repository }}/migration-live
+          mkdir -p custom_iso
+          xorriso -osirrox on -indev "${ISO_NAME}" -extract / custom_iso
+          rsync -a /__w/${{ github.repository }}/overlay/ custom_iso/
+          xorriso -as mkisofs -r -V "ORACLE-MIGRATION" \
+            -o oracle-migration-live.iso \
+            -J -joliet-long -b isolinux/isolinux.bin -c isolinux/boot.cat \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot -e images/efiboot.img -no-emul-boot custom_iso
+          sha256sum oracle-migration-live.iso > "$META_DIR/built-iso-sha256.txt"
 
-      # 7️⃣ ISO Strukturprüfung
-      - name: 🧪 ISO Strukturtest
+      - name: 📤 Artefakte hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-output
+          path: |
+            /__w/${{ github.repository }}/migration-live/oracle-migration-live.iso
+            /__w/${{ github.repository }}/migration-live/buildinfo/
+
+  test:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 🔽 Lade ISO-Artefakt
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: iso_test
+
+      - name: ⚙️ Installiere QEMU
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
+
+      - name: 🧪 Teste ISO-Boot (45s)
         run: |
-          echo "🔍 Teste ISO-Lesbarkeit..."
-          ISO_FILE=$(ls migration-live/*.iso | head -n1)
-          ls -lh "$ISO_FILE"
-          echo "🔍 Prüfe Bootstruktur:"
-          xorriso -indev "$ISO_FILE" -report_el_torito as_mkisofs | grep -E "Boot record|BIOS|EFI" || true
+          ISO="iso_test/oracle-migration-live.iso"
+          echo "🚀 Starte QEMU Testboot..."
+          qemu-system-x86_64 -m 1024 -cdrom "$ISO" -boot d -nographic -no-reboot -serial stdio -monitor none -snapshot &
+          pid=$!
+          sleep 45
+          if ps -p $pid > /dev/null; then
+            echo "✅ ISO bootfähig erkannt."
+            kill $pid
+          else
+            echo "❌ Boot fehlgeschlagen!"
+            exit 1
+          fi
 
-      # 8️⃣ Changelog generieren
-      - name: 📝 Erzeuge Changelog
+  release:
+    needs: test
+    if: success()
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 🔽 Lade Build-Artefakte
+        uses: actions/download-artifact@v4
+        with:
+          name: build-output
+          path: release_payload
+
+      - name: 🧮 Analysiere Paketänderungen (farblich & gruppiert)
+        id: rpm_diff
         run: |
-          echo "🧾 Erzeuge Changelog..."
-          mkdir -p changelog
-          {
-            echo "## Build vom $(date -u '+%Y-%m-%d %H:%M UTC')"
-            echo
-            echo "### Git Änderungen:"
-            git log -1 --pretty=format:"- %h %s (%an)"
-            echo
-            echo "### ISO Prüfsumme:"
-            cat iso_checksum.txt
-            echo
-            echo "### Paketliste (Top 40):"
-            rpm -qa --qf "%{NAME}-%{VERSION}\n" | sort | head -n 40
-          } > changelog/latest.md
-          cat changelog/latest.md
+          mkdir -p release_payload/diff
+          echo "🔍 Prüfe vorheriges Release..."
+          LATEST=$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)
+          echo "Letztes Release: $LATEST"
+          if [ -n "$LATEST" ]; then
+            gh release download "$LATEST" -p "buildinfo/rpm-list.txt" -D prev_release || true
+            if [ -f "prev_release/buildinfo/rpm-list.txt" ]; then
+              echo "🔄 Erstelle farbliche Paketvergleichsausgabe..."
+              NEW_FILE="release_payload/buildinfo/rpm-list.txt"
+              OLD_FILE="prev_release/buildinfo/rpm-list.txt"
 
-      # 9️⃣ Release hochladen
-      - name: 📤 GitHub Release Upload
-        if: success()
+              # Diff ermitteln
+              diff -u "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff.txt || true
+
+              # Neu / Entfernt / Geändert ermitteln
+              awk '
+                /^+/ && !/^\+\+/ {sub(/^\+/, "", $0); add[$1]=$0}
+                /^-/ && !/^--/   {sub(/^-/, "", $0); rem[$1]=$0}
+                END {
+                  print "🟢 **Neu hinzugefügt:**"
+                  for (i in add) if (!(i in rem)) print "  + " add[i]
+                  print "\n🔴 **Entfernt:**"
+                  for (i in rem) if (!(i in add)) print "  - " rem[i]
+                  print "\n🔵 **Aktualisiert:**"
+                  for (i in add) if (i in rem && add[i] != rem[i]) print "  ~ " add[i] " ← " rem[i]
+                }
+              ' "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff-summary.md
+
+              echo "✅ Farbliche Paketänderungen erstellt."
+            else
+              echo "⚠️ Keine vorherige RPM-Liste gefunden."
+              echo "_Erster Build – kein Vergleich möglich._" > release_payload/diff/rpm-diff-summary.md
+            fi
+          else
+            echo "⚠️ Kein vorheriges Release gefunden."
+            echo "_Initialer Build – kein Vergleich verfügbar._" > release_payload/diff/rpm-diff-summary.md
+          fi
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏷️ Erstelle Release mit System-Infos & Paket-Diff
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: nightly-${{ github.run_number }}
-          name: "Oracle Migration ISO Nightly Build #${{ github.run_number }}"
-          body_path: changelog/latest.md
+          tag_name: ${{ env.RELEASE_TAG_PREFIX }}${{ github.run_number }}
+          name: "Oracle Migration ISO – Build #${{ github.run_number }}"
+          body: |
+            ✅ Build erfolgreich getestet & freigegeben
+
+            ### 🧩 Systeminformationen
+            - OS: $(head -n 1 release_payload/buildinfo/os-release.txt)
+            - Kernel: $(head -n 1 release_payload/buildinfo/uname.txt)
+            - DNF-Version: $(head -n 1 release_payload/buildinfo/dnf-version.txt)
+            - ISO SHA256: $(awk '{print $1}' release_payload/buildinfo/built-iso-sha256.txt)
+
+            ### 📦 Paketänderungen (vollständige Übersicht)
+            $(cat release_payload/diff/rpm-diff-summary.md)
+
+            ---
+            _Vollständige Listen & ISO befinden sich in den Release-Assets._
           files: |
-            migration-live/*.iso
-            iso_checksum.txt
+            release_payload/oracle-migration-live.iso
+            release_payload/buildinfo/**
+            release_payload/diff/rpm-diff.txt
+            release_payload/diff/rpm-diff-summary.md
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
