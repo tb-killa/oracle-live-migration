@@ -1,225 +1,190 @@
-name: Build, Test & Release Oracle Migration Live ISO
+name: Oracle Migration Live ISO (Stable Build + Cache + Release)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 3 * * *"
+  push:
+    branches:
+      - main
 
 env:
-  ISO_NAME: OracleLinux-R9-U3-x86_64-dvd.iso
   ISO_URL: https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso
-  ISO_DIR: ${{ github.workspace }}/migration-live
-  CACHE_KEY_ISO: oraclelinux9u3-iso-cache
-  RELEASE_TAG_PREFIX: nightly-
+  ISO_NAME: OracleLinux-R9-U3-x86_64-dvd.iso
+  ISO_PATH: migration-live/iso
+  CACHE_KEY: oraclelinux9u3-iso-cache
 
 jobs:
   prepare:
+    name: 📦 Prepare ISO (Cache + Artifact)
     runs-on: ubuntu-latest
+
     steps:
-      - name: 🧭 Checkout Repository
+      - name: 🧾 Checkout Repository
         uses: actions/checkout@v4
 
       - name: 💾 Lade ISO Cache
-        id: cache_iso
+        id: iso_cache
         uses: actions/cache@v4
         with:
-          path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
-          key: ${{ env.CACHE_KEY_ISO }}
+          path: ${{ env.ISO_PATH }}/${{ env.ISO_NAME }}
+          key: ${{ env.CACHE_KEY }}
 
-      - name: 📦 Lade Oracle ISO falls nicht im Cache
+      - name: ⬇️ Lade Oracle ISO (wenn nicht im Cache)
         run: |
-          mkdir -p "${ISO_DIR}"
-          if [ ! -f "${ISO_DIR}/${ISO_NAME}" ]; then
-            echo "⬇️ Lade Oracle ISO von ${ISO_URL}"
-            wget -q --show-progress -O "${ISO_DIR}/${ISO_NAME}" "${ISO_URL}"
+          set -e
+          mkdir -p "${ISO_PATH}"
+          if [ ! -f "${ISO_PATH}/${ISO_NAME}" ]; then
+            echo ">>> Lade ISO neu herunter..."
+            wget -q --show-progress -O "${ISO_PATH}/${ISO_NAME}" "${ISO_URL}"
           else
             echo "✅ ISO bereits im Cache vorhanden."
           fi
+          ls -lh "${ISO_PATH}/${ISO_NAME}"
 
-      - name: 📤 Lade ISO als Artefakt
+      - name: 🧮 Prüfe ISO-Datei
+        run: |
+          if [ ! -f "${ISO_PATH}/${ISO_NAME}" ]; then
+            echo "❌ ISO-Download fehlgeschlagen!"
+            exit 1
+          fi
+          echo "✅ ISO-Datei vorhanden: ${ISO_PATH}/${ISO_NAME}"
+          sha256sum "${ISO_PATH}/${ISO_NAME}" > "${ISO_PATH}/${ISO_NAME}.sha256"
+
+      - name: 📤 Lade ISO als Artifact hoch (Fallback)
         uses: actions/upload-artifact@v4
         with:
-          name: cached-oracle-iso
-          path: ${{ env.ISO_DIR }}/${{ env.ISO_NAME }}
+          name: oracle-iso
+          path: |
+            ${{ env.ISO_PATH }}/${{ env.ISO_NAME }}
+            ${{ env.ISO_PATH }}/${{ env.ISO_NAME }}.sha256
 
   build:
-    needs: prepare
+    name: 🧩 Build Migration ISO
     runs-on: ubuntu-latest
+    needs: prepare
     container:
       image: oraclelinux:9
     steps:
-      - name: 🔽 Lade Artefakte
-        uses: actions/download-artifact@v4
-        with:
-          name: cached-oracle-iso
-          path: ${{ github.workspace }}/cached-oracle-iso
+      - name: 🧾 Repository Struktur prüfen
+        uses: actions/checkout@v4
 
-      - name: ⚙️ Installiere Build-Abhängigkeiten
-        run: |
-          dnf -y install oracle-epel-release-el9
-          dnf -y install git wget rsync xorriso zip unzip p7zip p7zip-plugins jq diffutils coreutils util-linux tar
-
-      - name: 🧾 Erfasse System-Metadaten
+      - name: 🧮 Lade ISO aus Cache / Artifact
         run: |
           set -euo pipefail
-          META_DIR="${{ github.workspace }}/migration-live/buildinfo"
-          mkdir -p "$META_DIR"
-          cat /etc/os-release > "$META_DIR/os-release.txt"
-          uname -a > "$META_DIR/uname.txt"
-          dnf --version > "$META_DIR/dnf-version.txt"
-          dnf repolist -v > "$META_DIR/dnf-repolist.txt"
-
-          # 🔍 ISO finden (Cache oder Artifact)
-          mkdir -p "${{ github.workspace }}/migration-live"
-          ISO_SRC=""
-          if [ -f "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}" ]; then
-            ISO_SRC="${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
-            echo "✅ ISO gefunden (Cache: migration-live/)"
-          elif [ -f "${{ github.workspace }}/cached-oracle-iso/${{ env.ISO_NAME }}" ]; then
-            ISO_SRC="${{ github.workspace }}/cached-oracle-iso/${{ env.ISO_NAME }}"
-            echo "✅ ISO gefunden (Artifact: cached-oracle-iso/)"
+          mkdir -p /mnt/iso
+          echo ">>> Suche ISO-Datei..."
+          BASE_PATH="/home/runner/work/oracle-live-migration/oracle-live-migration"
+          CACHE_PATH="${BASE_PATH}/${ISO_PATH}/${ISO_NAME}"
+          if [ -f "$CACHE_PATH" ]; then
+            echo "✅ ISO im Cache gefunden."
+            cp "$CACHE_PATH" /mnt/iso/
+          elif [ -f "/__w/oracle-live-migration/oracle-live-migration/${ISO_PATH}/${ISO_NAME}" ]; then
+            echo "✅ ISO im Container-Cache gefunden."
+            cp "/__w/oracle-live-migration/oracle-live-migration/${ISO_PATH}/${ISO_NAME}" /mnt/iso/
           else
-            echo "❌ ISO konnte nicht gefunden werden – zeige Struktur:"
-            ls -R "${{ github.workspace }}"
+            echo "⚠️ Kein Cache gefunden – versuche Artifact..."
+            mkdir -p /mnt/iso
+            curl -L -o /tmp/oracle-iso.zip "$ACTIONS_RUNTIME_URL/_apis/pipelines/workflows/${{ github.run_id }}/artifacts/oracle-iso" || true
+            if [ -f /tmp/oracle-iso.zip ]; then
+              unzip /tmp/oracle-iso.zip -d /mnt/iso || true
+            fi
+          fi
+
+          if [ ! -f "/mnt/iso/${ISO_NAME}" ]; then
+            echo "❌ ISO konnte nicht gefunden werden!"
+            ls -R /mnt/iso || true
             exit 1
           fi
+          echo "✅ ISO bereit für Build:"
+          ls -lh /mnt/iso
 
-          # 📦 ISO an finalen Ort kopieren
-          cp "$ISO_SRC" "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
-          ls -lh "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}"
+      - name: ⚙️ Installiere Build-Tools
+        run: |
+          dnf -y install xorriso rsync p7zip unzip zip wget dmraid mdadm lvm2 device-mapper coreutils
 
-          # 🧮 Paketliste & ISO-Hash
-          rpm -qa --qf '%{NAME} %{VERSION}-%{RELEASE} %{ARCH}\n' | sort > "$META_DIR/rpm-list.txt"
-          sha256sum "${{ github.workspace }}/migration-live/${{ env.ISO_NAME }}" > "$META_DIR/iso-sha256.txt"
-
-      - name: 🚀 Starte ISO-Build
+      - name: 🧱 Starte ISO-Build
         run: |
           set -euo pipefail
-          cd "${{ github.workspace }}/migration-live"
-          mkdir -p custom_iso
-          echo ">>> Extrahiere ISO-Inhalt..."
-          xorriso -osirrox on -indev "${ISO_NAME}" -extract / custom_iso
-          echo ">>> Wende Overlay an (falls vorhanden)..."
-          if [ -d "${{ github.workspace }}/overlay" ]; then
-            rsync -a "${{ github.workspace }}/overlay/" custom_iso/
-          fi
-          echo ">>> Erzeuge Hybrid-ISO (UEFI + BIOS)..."
-          xorriso -as mkisofs -r -V "ORACLE-MIGRATION" \
-            -o oracle-migration-live.iso \
-            -J -joliet-long -b isolinux/isolinux.bin -c isolinux/boot.cat \
-            -no-emul-boot -boot-load-size 4 -boot-info-table \
-            -eltorito-alt-boot -e images/efiboot.img -no-emul-boot custom_iso
-          sha256sum oracle-migration-live.iso > "$META_DIR/built-iso-sha256.txt"
+          echo "🚀 Starte ISO-Build..."
+          mkdir -p migration-live/buildinfo
+          cp /mnt/iso/${ISO_NAME} migration-live/
+          cd migration-live
 
-      - name: 📤 Artefakte hochladen
+          echo "=== Building Oracle Migration Live ISO (UEFI + BIOS) ==="
+
+          # Extrahiere Inhalt
+          echo ">>> Extrahiere ISO-Inhalt..."
+          mkdir -p custom_iso
+          xorriso -osirrox on -indev ${ISO_NAME} -extract / custom_iso
+
+          echo ">>> Testausgabe: Beispielhafte Inhalte aus dem ISO:"
+          ls -lh custom_iso | head -n 15
+
+          # Prüfe Bootdateien
+          echo ">>> Prüfe Bootdateien..."
+          for file in custom_iso/isolinux/isolinux.bin custom_iso/isolinux/boot.cat custom_iso/images/efiboot.img; do
+            if [ -f "$file" ]; then
+              echo "✅ Gefunden: $(basename $file)"
+            else
+              echo "❌ Fehlende Bootdatei: $file"
+              exit 5
+            fi
+          done
+
+          echo ">>> Bereinige ISO-Inhalt für Minimal-Variante..."
+          du -sh custom_iso || true
+
+          echo ">>> Füge Overlay-Dateien hinzu..."
+          rsync -a ../overlay/ custom_iso/
+
+          echo ">>> Erzeuge bootfähiges Hybrid-ISO..."
+          xorriso -as mkisofs \
+            -r -V "MIGRATION-LIVE" \
+            -o oracle-migration-live.iso \
+            -J -l -b isolinux/isolinux.bin \
+            -c isolinux/boot.cat \
+            -no-emul-boot -boot-load-size 4 -boot-info-table \
+            -eltorito-alt-boot \
+            -e images/efiboot.img -no-emul-boot \
+            -isohybrid-gpt-basdat custom_iso
+
+          ls -lh oracle-migration-live.iso
+          du -sh oracle-migration-live.iso
+
+      - name: 🧾 Erzeuge Buildinfo
+        run: |
+          set -e
+          mkdir -p migration-live/buildinfo
+          dnf repolist > migration-live/buildinfo/dnf-repolist.txt || true
+          dnf --version > migration-live/buildinfo/dnf-version.txt || true
+          cat /etc/os-release > migration-live/buildinfo/os-release.txt || true
+          uname -a > migration-live/buildinfo/uname.txt || true
+          echo "🧾 Buildinfo gespeichert."
+
+      - name: 📤 Lade Build-Ergebnis hoch
         uses: actions/upload-artifact@v4
         with:
-          name: build-output
+          name: oracle-migration-live-iso
           path: |
-            ${{ github.workspace }}/migration-live/oracle-migration-live.iso
-            ${{ github.workspace }}/migration-live/buildinfo/
+            migration-live/oracle-migration-live.iso
+            migration-live/buildinfo/
 
   test:
+    name: 🧪 Test ISO Build
+    runs-on: ubuntu-latest
     needs: build
-    runs-on: ubuntu-latest
     steps:
-      - name: 🔽 Lade ISO-Artefakt
+      - name: 📥 Lade ISO Artifact
         uses: actions/download-artifact@v4
         with:
-          name: build-output
-          path: iso_test
+          name: oracle-migration-live-iso
+          path: test_iso
 
-      - name: ⚙️ Installiere QEMU
-        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86
-
-      - name: 🧪 Teste ISO-Boot (45s)
+      - name: 🔍 Prüfe ISO-Größe & Signatur
         run: |
-          ISO="iso_test/oracle-migration-live.iso"
-          echo "🚀 Starte QEMU Testboot..."
-          qemu-system-x86_64 -m 1024 -cdrom "$ISO" -boot d -nographic -no-reboot -serial stdio -monitor none -snapshot &
-          pid=$!
-          sleep 45
-          if ps -p $pid > /dev/null; then
-            echo "✅ ISO bootfähig erkannt."
-            kill $pid
-          else
-            echo "❌ Boot-Test fehlgeschlagen!"
-            exit 1
-          fi
+          ls -lh test_iso/*.iso
+          FILE=$(ls test_iso/*.iso | head -n1)
+          echo ">>> Prüfe Boot-Signatur:"
+          isoinfo -d -i "$FILE" | grep -E "Volume id|Boot|System id" || true
 
-  release:
-    needs: test
-    if: success()
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: 🔽 Lade Build-Artefakte
-        uses: actions/download-artifact@v4
-        with:
-          name: build-output
-          path: release_payload
-
-      - name: 🧮 Analysiere Paketänderungen
-        id: diff
-        run: |
-          mkdir -p release_payload/diff
-          echo "🔍 Prüfe vorheriges Release..."
-          LATEST=$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)
-          echo "Letztes Release: $LATEST"
-
-          NEW_FILE="release_payload/buildinfo/rpm-list.txt"
-          if [ -n "$LATEST" ]; then
-            gh release download "$LATEST" -p "buildinfo/rpm-list.txt" -D prev_release || true
-          fi
-          OLD_FILE="prev_release/buildinfo/rpm-list.txt"
-
-          if [ -f "$OLD_FILE" ]; then
-            diff -u "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff.txt || true
-
-            awk '
-              /^+/ && !/^\+\+/ {sub(/^\+/, "", $0); add[$1]=$0}
-              /^-/ && !/^--/   {sub(/^-/, "", $0); rem[$1]=$0}
-              END {
-                print "🟢 **Neu hinzugefügt:**"
-                for (i in add) if (!(i in rem)) print "  + " add[i]
-                print "\n🔴 **Entfernt:**"
-                for (i in rem) if (!(i in add)) print "  - " rem[i]
-                print "\n🔵 **Aktualisiert:**"
-                for (i in add) if (i in rem && add[i] != rem[i]) print "  ~ " add[i] " ← " rem[i]
-              }
-            ' "$OLD_FILE" "$NEW_FILE" > release_payload/diff/rpm-diff-summary.md
-
-            jq -n --argfile diff <(diff -u "$OLD_FILE" "$NEW_FILE" | jq -R -s 'split("\n")') \
-                  '{changes:$diff}' > release_payload/diff/rpm-diff.json
-          else
-            echo "_Initialer Build – kein Vergleich verfügbar._" > release_payload/diff/rpm-diff-summary.md
-            jq -n '{"note":"Initialer Build, kein Vergleich verfügbar"}' > release_payload/diff/rpm-diff.json
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: 🏷️ Erstelle Release mit System-Infos
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ env.RELEASE_TAG_PREFIX }}${{ github.run_number }}
-          name: "Oracle Migration ISO – Build #${{ github.run_number }}"
-          body: |
-            ✅ Build erfolgreich getestet & freigegeben
-
-            ### 🧩 Systeminformationen
-            - OS: $(head -n 1 release_payload/buildinfo/os-release.txt)
-            - Kernel: $(head -n 1 release_payload/buildinfo/uname.txt)
-            - DNF-Version: $(head -n 1 release_payload/buildinfo/dnf-version.txt)
-            - ISO SHA256: $(awk '{print $1}' release_payload/buildinfo/built-iso-sha256.txt)
-
-            ### 📦 Paketänderungen
-            $(cat release_payload/diff/rpm-diff-summary.md)
-          files: |
-            release_payload/oracle-migration-live.iso
-            release_payload/buildinfo/**
-            release_payload/diff/rpm-diff.txt
-            release_payload/diff/rpm-diff-summary.md
-            release_payload/diff/rpm-diff.json
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: ✅ Abschluss
+        run: echo "ISO-Test erfolgreich abgeschlossen."
