@@ -5,7 +5,7 @@ on:
     branches: [ main ]
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *" # täglicher Nacht-Build 02:00 UTC
+    - cron: "0 2 * * *"
 
 jobs:
   build:
@@ -23,18 +23,20 @@ jobs:
       uses: actions/cache@v4
       id: cache_iso
       with:
-        path: .cache/iso
+        path: cache/iso
         key: rocky9-kde-live
 
     - name: 📦 Lade Rocky 9 KDE ISO (wenn kein Cache)
       if: steps.cache_iso.outputs.cache-hit != 'true'
       run: |
         set -e
-        mkdir -p .cache/iso
-        cd .cache/iso
+        mkdir -p cache/iso
+        cd cache/iso
         echo "📥 Lade offizielle Rocky Linux 9 KDE ISO..."
         dnf -y install wget
-        wget -q --show-progress https://dl.rockylinux.org/pub/rocky/9/live/x86_64/Rocky-9-KDE-x86_64-latest.iso -O Rocky-9-KDE-x86_64-latest.iso
+        wget -q --show-progress \
+          https://dl.rockylinux.org/pub/rocky/9/live/x86_64/Rocky-9-KDE-x86_64-latest.iso \
+          -O Rocky-9-KDE-x86_64-latest.iso
         echo "✅ ISO heruntergeladen und gecached."
 
     # === DNF Cache ===========================================================
@@ -65,15 +67,16 @@ jobs:
       run: |
         set -euo pipefail
         WORKDIR="migration-live"
-        SRC_ISO=".cache/iso/Rocky-9-KDE-x86_64-latest.iso"
-        mkdir -p "$WORKDIR/custom_iso"
+        SRC_ISO="cache/iso/Rocky-9-KDE-x86_64-latest.iso"
+        CUSTOM="$WORKDIR/custom_iso"
+        mkdir -p "$CUSTOM"
 
         echo "=== Entpacke ISO ==="
-        7z x -y -o"$WORKDIR/custom_iso" "$SRC_ISO" || echo "⚠️ Warnung beim Entpacken"
+        7z x -y -o"$CUSTOM" "$SRC_ISO" || echo "⚠️ Warnung beim Entpacken"
 
         echo "=== Prüfe Bootdateien ==="
         for f in isolinux/isolinux.bin isolinux/boot.cat images/efiboot.img; do
-          if [ -f "$WORKDIR/custom_iso/$f" ]; then
+          if [ -f "$CUSTOM/$f" ]; then
             echo "✅ $f vorhanden"
           else
             echo "⚠️ Fehlend: $f"
@@ -81,44 +84,70 @@ jobs:
         done
 
         echo "=== Setze Sprache & Locale ==="
-        mkdir -p "$WORKDIR/custom_iso/etc"
-        echo "LANG=de_DE.UTF-8" > "$WORKDIR/custom_iso/etc/locale.conf"
-        echo "KEYMAP=de" > "$WORKDIR/custom_iso/etc/vconsole.conf"
-        ln -sf /usr/share/zoneinfo/Europe/Berlin "$WORKDIR/custom_iso/etc/localtime"
+        mkdir -p "$CUSTOM/etc"
+        echo "LANG=de_DE.UTF-8" > "$CUSTOM/etc/locale.conf"
+        echo "KEYMAP=de" > "$CUSTOM/etc/vconsole.conf"
+        ln -sf /usr/share/zoneinfo/Europe/Berlin "$CUSTOM/etc/localtime"
 
-        echo "=== RAID + Migrationstools im Image vorbereiten ==="
-        mount --bind /dev "$WORKDIR/custom_iso/dev"
-        mount --bind /proc "$WORKDIR/custom_iso/proc"
-        mount --bind /sys "$WORKDIR/custom_iso/sys"
-        dnf -y --installroot="$WORKDIR/custom_iso" install \
-          mdadm lvm2 device-mapper kpartx virt-v2v libguestfs-tools \
-          qemu-kvm virt-install btrfs-progs xfsprogs ntfs-3g dialog newt || true
-        umount -l "$WORKDIR/custom_iso/dev" "$WORKDIR/custom_iso/proc" "$WORKDIR/custom_iso/sys" || true
+        echo "=== Migrationstools + RAID im Image bereitstellen (installroot) ==="
+        mkdir -p "$CUSTOM/dev" "$CUSTOM/proc" "$CUSTOM/sys"
+        mount --bind /dev "$CUSTOM/dev" || true
+        mount --bind /proc "$CUSTOM/proc" || true
+        mount --bind /sys "$CUSTOM/sys" || true
 
-        echo "=== Aktiviere RAID-Module beim Boot ==="
-        mkdir -p "$WORKDIR/custom_iso/etc"
-        cat <<'EOF' > "$WORKDIR/custom_iso/etc/rc.d/rc.local"
-        #!/bin/bash
-        echo "[INIT] Lade RAID-Module..."
-        for mod in dm_mod md_mod raid0 raid1 raid10 raid456; do
-          modprobe $mod || echo "[WARN] Modul $mod konnte nicht geladen werden."
-        done
-        exit 0
-        EOF
-        chmod +x "$WORKDIR/custom_iso/etc/rc.d/rc.local"
+        dnf -y --installroot="$CUSTOM" install \
+          virt-v2v libguestfs-tools qemu-kvm virt-install \
+          mdadm lvm2 device-mapper kpartx btrfs-progs xfsprogs ntfs-3g \
+          smartmontools lsscsi parted dialog newt || true
 
-        echo "=== Bereinige unnötige Inhalte ==="
-        rm -rf "$WORKDIR/custom_iso/AppStream" "$WORKDIR/custom_iso/BaseOS" || true
-        echo "✅ ISO-Basis reduziert"
+        umount -l "$CUSTOM/dev" "$CUSTOM/proc" "$CUSTOM/sys" || true
+
+        echo "=== Füge RAID-Autoload (systemd) hinzu ==="
+        install -d "$CUSTOM/usr/local/sbin"
+        cat > "$CUSTOM/usr/local/sbin/raid-modprobe.sh" <<'EOS'
+#!/bin/bash
+set -e
+echo "[INIT] Lade RAID/DM-Module..."
+mods=(dm_mod md_mod raid0 raid1 raid10 raid456)
+for mod in "${mods[@]}"; do
+  if ! /usr/sbin/modprobe "$mod"; then
+    echo "[WARN] Modul $mod konnte nicht geladen werden." >&2
+  fi
+done
+exit 0
+EOS
+        chmod +x "$CUSTOM/usr/local/sbin/raid-modprobe.sh"
+
+        install -d "$CUSTOM/etc/systemd/system"
+        cat > "$CUSTOM/etc/systemd/system/raid-modprobe.service" <<'EOS'
+[Unit]
+Description=Load RAID and Device Mapper modules at boot
+DefaultDependencies=no
+After=systemd-modules-load.service
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/raid-modprobe.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOS
+        install -d "$CUSTOM/etc/systemd/system/multi-user.target.wants"
+        ln -sf /etc/systemd/system/raid-modprobe.service \
+          "$CUSTOM/etc/systemd/system/multi-user.target.wants/raid-modprobe.service"
 
         echo "=== Erzeuge Hybrid-ISO (UEFI + BIOS) ==="
         xorriso -as mkisofs \
           -iso-level 3 \
           -volid "Rocky-Migration-Live" \
-          -eltorito-boot isolinux/isolinux.bin -no-emul-boot -boot-load-size 4 -boot-info-table \
+          -eltorito-boot isolinux/isolinux.bin \
+          -no-emul-boot -boot-load-size 4 -boot-info-table \
           -eltorito-alt-boot -e images/efiboot.img -no-emul-boot -isohybrid-gpt-basdat \
-          -output "$WORKDIR/rocky-migration-live.iso" "$WORKDIR/custom_iso"
+          -output "$WORKDIR/rocky-migration-live.iso" "$CUSTOM"
 
+        echo "✅ Ergebnis:"
         ls -lh "$WORKDIR/rocky-migration-live.iso"
 
     # === QEMU Smoke Test =====================================================
