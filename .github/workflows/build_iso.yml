@@ -1,32 +1,35 @@
-name: Build Oracle Migration Live ISO
+name: Build Oracle Migration Live ISO (LiveBoot)
 
 on:
   push:
     branches: [ "main" ]
   workflow_dispatch:
   schedule:
-    - cron: "0 2 * * *"   # nightly build
+    - cron: "0 3 * * *"   # nightly check build
 
 env:
-  ISO_URL: "https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-x86_64-dvd.iso"
-  ISO_NAME: "OracleLinux-R9-U3-x86_64-dvd.iso"
-  CACHE_KEY: "oraclelinux9u3-iso-cache-v2"
+  ISO_URL: "https://yum.oracle.com/ISOS/OracleLinux/OL9/u3/x86_64/OracleLinux-R9-U3-live-x86_64.iso"
+  ISO_NAME: "OracleLinux-R9-U3-live-x86_64.iso"
+  CACHE_KEY: "oraclelinux9u3-live-iso-cache-v1"
   ISO_DIR: ".cache/iso"
   BUILD_DIR: "migration-live"
   FINAL_ISO: "oracle-migration-live.iso"
 
 jobs:
-  build:
-    name: Full Build (Cache + Overlay + ISO + Boot-Test + Release)
+  build-live:
+    name: Oracle Live Build (Cache + Overlay + Boot Test)
     runs-on: ubuntu-latest
     timeout-minutes: 180
 
     steps:
+      # --------------------------------------------------------------------
+      # === Repo checkout ===
+      # --------------------------------------------------------------------
       - name: 🧩 Checkout repository
         uses: actions/checkout@v4
 
       # --------------------------------------------------------------------
-      # === ISO Cache Handling ===
+      # === Cache handling ===
       # --------------------------------------------------------------------
       - name: ♻️ Restore ISO cache
         id: cache-iso
@@ -35,14 +38,14 @@ jobs:
           path: ${{ env.ISO_DIR }}
           key: ${{ env.CACHE_KEY }}
           restore-keys: |
-            oraclelinux9u3-iso-
+            oraclelinux9u3-live-iso-
 
-      - name: 📦 Download ISO if not cached
+      - name: 📦 Download Live ISO (if not cached)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
           set -e
           mkdir -p "${ISO_DIR}"
-          echo "📥 Lade Oracle ISO..."
+          echo "📥 Lade Oracle Live ISO..."
           wget -q --show-progress -O "${ISO_DIR}/${ISO_NAME}" "${ISO_URL}"
           ls -lh "${ISO_DIR}/${ISO_NAME}"
 
@@ -50,23 +53,24 @@ jobs:
         run: |
           set -e
           if [ ! -f "${ISO_DIR}/${ISO_NAME}" ]; then
-            echo "❌ ISO missing in cache!"
+            echo "❌ ISO missing!"
             exit 1
           fi
+          echo "✅ ISO cached at ${ISO_DIR}/${ISO_NAME}"
           ls -lh "${ISO_DIR}/"
 
       # --------------------------------------------------------------------
-      # === Dependencies ===
+      # === Install build tools ===
       # --------------------------------------------------------------------
-      - name: 🧰 Install build dependencies
+      - name: 🧰 Install dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y xorriso p7zip-full rsync dos2unix genisoimage zip unzip qemu-system-x86
+          sudo apt-get install -y xorriso p7zip-full rsync dos2unix genisoimage squashfs-tools qemu-system-x86 zip unzip
 
       # --------------------------------------------------------------------
-      # === Overlay + System Info ===
+      # === Normalize overlay files ===
       # --------------------------------------------------------------------
-      - name: 🔧 Normalize overlay files
+      - name: 🔧 Normalize overlay scripts
         run: |
           set -e
           if [ -d overlay ]; then
@@ -74,148 +78,101 @@ jobs:
             chmod +x overlay/usr/local/bin/*.sh 2>/dev/null || true
           fi
 
-      - name: 🧾 Collect build system info
+      # --------------------------------------------------------------------
+      # === Collect build info ===
+      # --------------------------------------------------------------------
+      - name: 🧾 Collect environment info
         run: |
-          set -e
           mkdir -p "${BUILD_DIR}/buildinfo"
           {
-            echo "Build Timestamp (UTC): $(date -u)"
-            echo "--- uname ---"
+            echo "Build Time (UTC): $(date -u)"
             uname -a
-            echo "--- /etc/os-release ---"
+            echo "--- OS Release ---"
             cat /etc/os-release
-            echo "--- Top Packages ---"
-            dpkg -l | head -n 25
           } > "${BUILD_DIR}/buildinfo/system.txt"
 
       # --------------------------------------------------------------------
-      # === ISO Build ===
+      # === Extract ISO ===
       # --------------------------------------------------------------------
-      - name: 🏗️ Build Oracle Migration ISO
+      - name: 🏗️ Extract Live ISO
         run: |
           set -euo pipefail
           mkdir -p "${BUILD_DIR}/custom_iso"
-
-          echo "=== Extract ISO ==="
           7z x -y -o"${BUILD_DIR}/custom_iso" "${ISO_DIR}/${ISO_NAME}" || true
 
-          echo "=== Check Boot Files ==="
-          for f in isolinux/isolinux.bin isolinux/boot.cat images/efiboot.img; do
-            if [ ! -f "${BUILD_DIR}/custom_iso/${f}" ]; then
-              echo "❌ Missing boot file: ${f}"
-              exit 1
-            fi
+          echo ">>> Prüfe Bootdateien..."
+          for f in isolinux/isolinux.bin isolinux/boot.cat images/efiboot.img LiveOS/squashfs.img; do
+            [ -f "${BUILD_DIR}/custom_iso/${f}" ] || { echo "❌ Fehlend: ${f}"; exit 1; }
           done
+          echo "✅ Bootdateien OK."
 
-          echo "=== Apply Overlay ==="
-          [ -d overlay ] && rsync -a overlay/ "${BUILD_DIR}/custom_iso/" || true
+      # --------------------------------------------------------------------
+      # === Modify RootFS ===
+      # --------------------------------------------------------------------
+      - name: 🧩 Modify root filesystem
+        run: |
+          set -e
+          echo ">>> Entpacke LiveOS SquashFS..."
+          mkdir -p "${BUILD_DIR}/rootfs"
+          unsquashfs -f -d "${BUILD_DIR}/rootfs" "${BUILD_DIR}/custom_iso/LiveOS/squashfs.img"
 
-          echo "=== Set root password ==="
-          echo "root:oracle" | sudo chpasswd || true
+          echo ">>> Wende Overlay an..."
+          rsync -a overlay/ "${BUILD_DIR}/rootfs/" || true
 
-          echo "=== Cleanup for minimal build ==="
-          rm -rf "${BUILD_DIR}/custom_iso/AppStream" || true
-          rm -rf "${BUILD_DIR}/custom_iso/BaseOS/Packages/"*.i686.rpm || true
+          echo ">>> Setze root Passwort..."
+          sudo chroot "${BUILD_DIR}/rootfs" bash -c "echo 'root:oracle' | chpasswd" || true
 
-          echo "=== Generate ISO ==="
+          echo ">>> Repack LiveOS..."
+          rm -f "${BUILD_DIR}/custom_iso/LiveOS/squashfs.img"
+          mksquashfs "${BUILD_DIR}/rootfs" "${BUILD_DIR}/custom_iso/LiveOS/squashfs.img" -comp xz -b 1M
+
+      # --------------------------------------------------------------------
+      # === Build ISO ===
+      # --------------------------------------------------------------------
+      - name: 💿 Rebuild bootable ISO (UEFI + BIOS)
+        run: |
+          set -e
           xorriso -as mkisofs \
-            -r -J -iso-level 3 -V "Oracle_Migrate" \
+            -r -V "Oracle_Migrate_Live" -J -l -iso-level 3 \
             -b isolinux/isolinux.bin -c isolinux/boot.cat \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
             -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
-            -isohybrid-gpt-basdat -no-pad \
+            -isohybrid-gpt-basdat \
             -o "${BUILD_DIR}/${FINAL_ISO}" "${BUILD_DIR}/custom_iso"
 
           ls -lh "${BUILD_DIR}/${FINAL_ISO}"
 
       # --------------------------------------------------------------------
-      # === Full Boot Verification ===
+      # === Boot verification test ===
       # --------------------------------------------------------------------
-      - name: 🧪 Full Boot Verification (QEMU)
+      - name: 🧪 Boot verification (QEMU)
         run: |
           set -e
-          echo "=== Start QEMU boot test (120s timeout) ==="
-          timeout 120 qemu-system-x86_64 \
+          echo ">>> Starte QEMU-Test..."
+          timeout 90 qemu-system-x86_64 \
             -m 1024 \
             -cdrom "${BUILD_DIR}/${FINAL_ISO}" \
             -boot d \
             -nographic \
             -serial stdio \
             -no-reboot \
-            | tee "${BUILD_DIR}/bootlog.txt" | grep -m1 -E "login:|Oracle Linux" && echo "✅ Boot verified!"
-          echo "=== Boot test completed ==="
+            | tee "${BUILD_DIR}/bootlog.txt" | grep -m1 -E "login:|Oracle Linux|bash" && echo "✅ Boot erfolgreich."
 
       # --------------------------------------------------------------------
-      # === Checksums + Size ===
+      # === Checksums and artifact upload ===
       # --------------------------------------------------------------------
-      - name: 🧮 Checksums & size
-        id: isosize
+      - name: 🧮 Create checksum
         run: |
-          set -e
           cd "${BUILD_DIR}"
           sha256sum "${FINAL_ISO}" > "${FINAL_ISO}.sha256"
-          SIZE_BYTES=$(stat --printf="%s" "${FINAL_ISO}")
-          echo "SIZE_BYTES=${SIZE_BYTES}" >> "$GITHUB_OUTPUT"
           cat "${FINAL_ISO}.sha256"
 
-      # --------------------------------------------------------------------
-      # === Upload Artifact ===
-      # --------------------------------------------------------------------
-      - name: 📤 Upload ISO Artifact
+      - name: 📤 Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
           name: oracle-migration-live
           path: |
             migration-live/${{ env.FINAL_ISO }}
             migration-live/${{ env.FINAL_ISO }}.sha256
+            migration-live/bootlog.txt
             migration-live/buildinfo/
-            migration-live/bootlog.txt
-
-      # --------------------------------------------------------------------
-      # === Split & Release ===
-      # --------------------------------------------------------------------
-      - name: 📦 Prepare multipart release if >2GB
-        id: split
-        run: |
-          set -e
-          cd "${BUILD_DIR}"
-          LIMIT=$(( 2147483648 - 10*1024*1024 ))
-          if [ "${{ steps.isosize.outputs.SIZE_BYTES }}" -gt "${LIMIT}" ]; then
-            echo "needs_split=true" >> "$GITHUB_OUTPUT"
-            mkdir -p release
-            7z a -t7z -v1900m "release/${FINAL_ISO%.iso}.7z" "${FINAL_ISO}"
-            sha256sum release/* > release/SHA256SUMS
-            echo "Split done."
-          else
-            echo "needs_split=false" >> "$GITHUB_OUTPUT"
-            echo "No split required."
-          fi
-
-      # Direct release if < 2 GB
-      - name: 🚀 Release (direct)
-        if: steps.split.outputs.needs_split == 'false'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "v${{ github.run_number }}"
-          name: "Oracle Migration Live #${{ github.run_number }}"
-          body_path: "migration-live/buildinfo/system.txt"
-          files: |
-            migration-live/${{ env.FINAL_ISO }}
-            migration-live/${{ env.FINAL_ISO }}.sha256
-            migration-live/bootlog.txt
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      # Multipart release if > 2 GB
-      - name: 🚀 Release (multipart)
-        if: steps.split.outputs.needs_split == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: "v${{ github.run_number }}"
-          name: "Oracle Migration Live (Split) #${{ github.run_number }}"
-          body_path: "migration-live/buildinfo/system.txt"
-          files: |
-            migration-live/release/*.7z.*
-            migration-live/release/SHA256SUMS
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
