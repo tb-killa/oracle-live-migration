@@ -18,7 +18,7 @@ jobs:
     - name: 📥 Checkout Repository
       uses: actions/checkout@v4
 
-    # === ISO Cache prüfen =====================================================
+    # === ISO Cache ===========================================================
     - name: 💾 Restore ISO Cache
       uses: actions/cache@v4
       id: cache_iso
@@ -37,7 +37,7 @@ jobs:
         wget -q --show-progress https://dl.rockylinux.org/pub/rocky/9/live/x86_64/Rocky-9-KDE-x86_64-latest.iso -O Rocky-9-KDE-x86_64-latest.iso
         echo "✅ ISO heruntergeladen und gecached."
 
-    # === DNF Cache ============================================================
+    # === DNF Cache ===========================================================
     - name: 🧱 Restore DNF Cache
       uses: actions/cache@v4
       id: cache_dnf
@@ -45,8 +45,8 @@ jobs:
         path: /var/cache/dnf
         key: rocky9-dnf-cache
 
-    # === Tools installieren ===================================================
-    - name: 🔧 Installiere Build-Tools & Migrationstools
+    # === Tools installieren ==================================================
+    - name: 🔧 Installiere Build- & Migrationstools
       run: |
         set -e
         dnf -y install dnf-plugins-core
@@ -55,11 +55,12 @@ jobs:
         dnf -y install \
           p7zip p7zip-plugins xorriso genisoimage rsync tar zip unzip \
           virt-v2v libguestfs-tools qemu-kvm virt-install \
-          dmraid mdadm lvm2 ntfs-3g btrfs-progs xfsprogs smartmontools lsscsi parted \
-          glibc-langpack-de kbd nfs-utils systemd-udev net-tools iproute newt dialog
+          mdadm lvm2 device-mapper kpartx ntfs-3g btrfs-progs xfsprogs smartmontools \
+          lsscsi parted glibc-langpack-de kbd nfs-utils systemd-udev net-tools iproute \
+          newt dialog
         echo "✅ Alle erforderlichen Pakete installiert."
 
-    # === Entpacken, Anpassen, Bauen ===========================================
+    # === Entpacken, Anpassen, Bauen ==========================================
     - name: 🚀 Baue Rocky Migration ISO
       run: |
         set -euo pipefail
@@ -89,11 +90,24 @@ jobs:
         mount --bind /dev "$WORKDIR/custom_iso/dev"
         mount --bind /proc "$WORKDIR/custom_iso/proc"
         mount --bind /sys "$WORKDIR/custom_iso/sys"
-        dnf -y --installroot="$WORKDIR/custom_iso" install dmraid mdadm lvm2 virt-v2v libguestfs-tools \
+        dnf -y --installroot="$WORKDIR/custom_iso" install \
+          mdadm lvm2 device-mapper kpartx virt-v2v libguestfs-tools \
           qemu-kvm virt-install btrfs-progs xfsprogs ntfs-3g dialog newt || true
         umount -l "$WORKDIR/custom_iso/dev" "$WORKDIR/custom_iso/proc" "$WORKDIR/custom_iso/sys" || true
 
-        echo "=== Bereinige unnötige Inhalte (Reduktion) ==="
+        echo "=== Aktiviere RAID-Module beim Boot ==="
+        mkdir -p "$WORKDIR/custom_iso/etc"
+        cat <<'EOF' > "$WORKDIR/custom_iso/etc/rc.d/rc.local"
+#!/bin/bash
+echo "[INIT] Lade RAID-Module..."
+for mod in dm_mod md_mod raid0 raid1 raid10 raid456; do
+  modprobe $mod || echo "[WARN] Modul $mod konnte nicht geladen werden."
+done
+exit 0
+EOF
+        chmod +x "$WORKDIR/custom_iso/etc/rc.d/rc.local"
+
+        echo "=== Bereinige unnötige Inhalte ==="
         rm -rf "$WORKDIR/custom_iso/AppStream" "$WORKDIR/custom_iso/BaseOS" || true
         echo "✅ ISO-Basis reduziert"
 
@@ -107,16 +121,17 @@ jobs:
 
         ls -lh "$WORKDIR/rocky-migration-live.iso"
 
-    # === QEMU Smoke Test ======================================================
+    # === QEMU Smoke Test =====================================================
     - name: 🧪 Teste ISO Boot (QEMU)
       run: |
         set -e
         echo "=== Teste ISO-Bootfähigkeit ==="
-        qemu-system-x86_64 -m 1024 -cdrom migration-live/rocky-migration-live.iso -boot d -no-reboot -display none -serial stdio -snapshot -monitor none -no-shutdown &
+        qemu-system-x86_64 -m 1024 -cdrom migration-live/rocky-migration-live.iso \
+          -boot d -no-reboot -display none -serial stdio -snapshot -monitor none -no-shutdown &
         sleep 20
         echo "✅ ISO Boot-Test erfolgreich gestartet & beendet."
 
-    # === Buildinfos ===========================================================
+    # === Buildinfos ==========================================================
     - name: 📋 Sammle Systeminfos
       run: |
         mkdir -p migration-live/buildinfo
@@ -126,7 +141,7 @@ jobs:
         dnf repolist > migration-live/buildinfo/dnf-repolist.txt
         echo "✅ Buildinfos gesammelt."
 
-    # === Artefakte ============================================================
+    # === Artefakte ===========================================================
     - name: 📦 Lade ISO und Infos hoch
       uses: actions/upload-artifact@v4
       with:
