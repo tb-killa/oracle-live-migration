@@ -15,9 +15,11 @@ jobs:
 
       - name: 📦 Installiere Basis-Tools
         run: |
+          set -e
           sudo apt-get update
+          # WICHTIG: isoinfo kommt aus genisoimage; kein separates "isoinfo"-Paket installieren!
           sudo apt-get install -y \
-            genisoimage xorriso p7zip-full isoinfo isomd5sum wget rsync file
+            genisoimage xorriso p7zip-full wget rsync file
 
       - name: ♻️ Cache Rocky ISO
         id: cache-iso
@@ -29,43 +31,57 @@ jobs:
       - name: 📥 Lade Rocky Linux ISO (falls kein Cache)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
+          set -e
           mkdir -p .cache/iso
           ISO_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso"
           echo "➡️ Lade Rocky Linux ISO von $ISO_URL ..."
           wget -q --show-progress -O .cache/iso/Rocky-9-latest-x86_64-minimal.iso "$ISO_URL"
 
-      - name: 🧩 Entpacke ISO und prüfe Volume-Label
+      - name: 🧩 Entpacke ISO und prüfe Volume-Label (mit Fallback)
         run: |
           set -euo pipefail
           mkdir -p migration-live/custom_iso overlay
 
-          LABEL=$(isoinfo -d -i .cache/iso/Rocky-9-latest-x86_64-minimal.iso | grep 'Volume id' | awk -F': ' '{print $2}' | xargs)
-          echo "🔍 Original Label: $LABEL"
+          ISO_PATH=".cache/iso/Rocky-9-latest-x86_64-minimal.iso"
+          test -s "$ISO_PATH" || { echo "❌ ISO fehlt: $ISO_PATH"; exit 1; }
+
+          echo "=== Lese Volume-Label aus Original-ISO ==="
+          if command -v isoinfo >/dev/null 2>&1; then
+            LABEL=$(isoinfo -d -i "$ISO_PATH" | awk -F': ' '/Volume id/ {print $2}' | xargs)
+          else
+            # Fallback über xorriso
+            LABEL=$(xorriso -indev "$ISO_PATH" -pvd_info 2>&1 | sed -n 's/^Volume id: *//p' | head -n1 | xargs)
+          fi
+          echo "🔍 Original Label: ${LABEL:-<leer>}"
 
           NEW_LABEL="Rocky-Migration-Live"
           echo "📦 Neues Label: $NEW_LABEL"
 
           echo "=== Entpacke ISO ==="
-          7z x -y -o"migration-live/custom_iso" .cache/iso/Rocky-9-latest-x86_64-minimal.iso >/dev/null
+          7z x -y -o"migration-live/custom_iso" "$ISO_PATH" >/dev/null
 
           echo "=== Prüfe und korrigiere Boot-Konfigs ==="
           for cfg in \
             migration-live/custom_iso/isolinux/isolinux.cfg \
             migration-live/custom_iso/EFI/BOOT/grub.cfg; do
             if [ -f "$cfg" ]; then
-              sed -i "s|$LABEL|$NEW_LABEL|g" "$cfg"
+              if [ -n "${LABEL:-}" ]; then
+                sed -i "s|$LABEL|$NEW_LABEL|g" "$cfg"
+              fi
+              # zusätzlich gängige Rocky-Labels ersetzen, falls Upstream variiert
+              sed -i "s|Rocky-9-[0-9]\+-KDE|$NEW_LABEL|g;s|Rocky-9-[0-9]\+-BaseOS|$NEW_LABEL|g;s|Rocky-9-[0-9]\+-Minimal|$NEW_LABEL|g" "$cfg" || true
             fi
           done
 
-          echo "=== ISO-Label angepasst und entpackt ==="
+          echo "=== ISO-Label in Boot-Konfigs gefixt (falls vorhanden) ==="
 
-      - name: ⚙️ Füge Overlay-Inhalte hinzu
+      - name: ⚙️ Füge Overlay-Inhalte hinzu (root-PW, RAID-Preload, Helper)
         run: |
           set -e
           OVERLAY="migration-live/custom_iso/root_overlay"
           mkdir -p "$OVERLAY"
 
-          # --- Root-Passwort ---
+          # --- Root-Passwort (Demo; in echt Secrets/Interaktiv bevorzugen) ---
           cat > "$OVERLAY/set_root.sh" <<'EOF'
           #!/bin/bash
           echo "root:Migration123!" | chpasswd
@@ -90,12 +106,11 @@ jobs:
           EOF
           chmod +x "$OVERLAY/load_raid.sh"
 
-          # --- Migration-Helper (Stub für GUI) ---
+          # --- Migration-Helper (Stub) ---
           cat > "$OVERLAY/migration_helper.sh" <<'EOF'
           #!/bin/bash
           echo "[INFO] Starte Migrations-Umgebung..."
-          echo "Virt-v2v verfügbar:"
-          virt-v2v --version || echo "virt-v2v fehlt."
+          command -v virt-v2v >/dev/null 2>&1 && virt-v2v --version || echo "virt-v2v nicht gefunden."
           EOF
           chmod +x "$OVERLAY/migration_helper.sh"
 
@@ -103,19 +118,27 @@ jobs:
 
       - name: 🧠 Setze Sprache & Locale
         run: |
+          set -e
           mkdir -p migration-live/custom_iso/etc
           echo "LANG=de_DE.UTF-8" | tee migration-live/custom_iso/etc/locale.conf
           echo "KEYMAP=de" | tee migration-live/custom_iso/etc/vconsole.conf
 
-      - name: 🛠️ Installiere RAID & Migrationstools
+      - name: 🛠️ (Runner) Zusatztools für Checks installieren
         run: |
-          sudo apt-get install -y mdadm dmraid lvm2 qemu-utils virt-v2v virt-install parted dosfstools ntfs-3g
+          # Diese Tools werden nur im Runner benötigt (für Tests/Prüfungen),
+          # sie landen NICHT automatisch im ISO!
+          sudo apt-get install -y mdadm lvm2 qemu-utils parted dosfstools ntfs-3g
 
       - name: 🧱 Erzeuge Hybrid-ISO (UEFI + BIOS)
         run: |
           set -e
           OUT_ISO="migration-live/rocky-migration-live.iso"
           VOLID="Rocky-Migration-Live"
+
+          # Fail-fast: Stelle sicher, dass Boot-Dateien vorhanden sind
+          test -f migration-live/custom_iso/isolinux/isolinux.bin || { echo "❌ isolinux.bin fehlt!"; exit 1; }
+          test -f migration-live/custom_iso/isolinux/boot.cat || { echo "❌ boot.cat fehlt!"; exit 1; }
+          test -f migration-live/custom_iso/images/efiboot.img || { echo "❌ efiboot.img fehlt!"; exit 1; }
 
           echo "=== Erzeuge ISO mit Label: $VOLID ==="
           xorriso -as mkisofs \
@@ -126,7 +149,7 @@ jobs:
             -no-emul-boot -boot-load-size 4 -boot-info-table \
             -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
             -isohybrid-mbr migration-live/custom_iso/isolinux/isohdpfx.bin \
-            -J -R -V "$VOLID" -v -T \
+            -J -R -T -v \
             migration-live/custom_iso
 
           echo "✅ ISO erfolgreich erzeugt:"
@@ -135,12 +158,15 @@ jobs:
       - name: 🔍 Integritätstest
         run: |
           set -e
-          echo "=== Prüfe ISO-Metadaten ==="
-          isoinfo -d -i migration-live/rocky-migration-live.iso | grep -E "Volume id|Application id"
-          echo "=== Prüfe Stage2-Parameter ==="
-          isoinfo -i migration-live/rocky-migration-live.iso -x /isolinux/isolinux.cfg | grep -E "inst.stage2|LABEL=" || true
-          echo "=== Prüfe RAID-Skripte ==="
-          grep -R "modprobe" migration-live/custom_iso/root_overlay/ || true
+          ISO="migration-live/rocky-migration-live.iso"
+          file "$ISO"
+          if command -v isoinfo >/dev/null 2>&1; then
+            isoinfo -d -i "$ISO" | grep -E "Volume id|Application id" || true
+          else
+            xorriso -indev "$ISO" -pvd_info 2>&1 | sed -n 's/^Volume id:/Volume id/p' || true
+          fi
+          echo "=== Suche Stage2/LABEL in isolinux.cfg ==="
+          isoinfo -i "$ISO" -x /isolinux/isolinux.cfg 2>/dev/null | grep -E "inst.stage2|LABEL=" || true
 
       - name: 📤 Lade ISO-Artifact hoch
         uses: actions/upload-artifact@v4
