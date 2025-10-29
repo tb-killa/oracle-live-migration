@@ -9,14 +9,17 @@ jobs:
   build-live-iso:
     runs-on: ubuntu-latest
     steps:
-      - name: 🧰 Checkout
+      # ------------------------------------------------------------------------
+      - name: 🧰 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: ⚙️ Install Base Tools
+      # ------------------------------------------------------------------------
+      - name: ⚙️ Install Build Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y p7zip-full genisoimage xorriso qemu-system-x86 jq wget
+          sudo apt-get install -y p7zip-full xorriso qemu-system-x86 genisoimage syslinux-utils jq wget
 
+      # ------------------------------------------------------------------------
       - name: 💾 Restore ISO Cache
         id: cache-iso
         uses: actions/cache@v4
@@ -24,24 +27,31 @@ jobs:
           path: .cache/iso
           key: rocky9-mate-live-iso
 
-      - name: 📦 Download Rocky MATE Live ISO (if not cached)
+      # ------------------------------------------------------------------------
+      - name: 📦 Download Rocky 9.6 MATE Live ISO (if not cached)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
           mkdir -p .cache/iso
           cd .cache/iso
+          echo "📥 Lade Rocky 9.6 MATE Live ISO herunter..."
           wget -q --show-progress https://dl.rockylinux.org/vault/rocky/9.6/live/x86_64/Rocky-9-MATE-x86_64-latest.iso -O Rocky-9-MATE-x86_64-latest.iso
+          echo "✅ Download abgeschlossen"
           ls -lh
 
+      # ------------------------------------------------------------------------
       - name: 🧩 Extract ISO
         run: |
           mkdir -p migration-live/custom_iso
           7z x .cache/iso/Rocky-9-MATE-x86_64-latest.iso -o"migration-live/custom_iso" -y
+          echo "=== Beispielhafte Inhalte ==="
+          ls -lh migration-live/custom_iso | head -n 15
 
-      - name: 🔧 Integrate Tools & RAID Drivers
+      # ------------------------------------------------------------------------
+      - name: 🔧 Integrate RAID + Migration Tools
         run: |
           cat << 'EOF' > migration-live/custom_iso/auto_raid_setup.sh
           #!/bin/bash
-          echo "🔧 Initialisiere RAID und Migrationstools..." | tee /var/log/livecheck.log
+          echo "🔧 Initialisiere RAID- und Migrationstools..." | tee /var/log/livecheck.log
           dnf install -y kernel-modules-extra mdadm dmraid lvm2 virt-v2v virt-install virt-manager --setopt=install_weak_deps=False --skip-broken
           for mod in isci dm_mod md_mod raid0 raid1 raid10 raid456 multipath; do
               modprobe $mod 2>/dev/null || echo "❌ Modul $mod fehlt" >> /var/log/livecheck.log
@@ -54,40 +64,56 @@ jobs:
           EOF
           chmod +x migration-live/custom_iso/auto_raid_setup.sh
 
-      - name: 🌍 Set Default Locale to German
+      # ------------------------------------------------------------------------
+      - name: 🌍 Set Locale & Keyboard
         run: |
           cat << 'EOF' > migration-live/custom_iso/locale_setup.sh
           #!/bin/bash
+          echo "🌍 Setze Sprache & Tastatur auf Deutsch..." | tee -a /var/log/livecheck.log
           localectl set-locale LANG=de_DE.UTF-8
           localectl set-keymap de
           timedatectl set-timezone Europe/Berlin
           EOF
           chmod +x migration-live/custom_iso/locale_setup.sh
 
-      - name: 🖥️ Add Desktop Instructions
+      # ------------------------------------------------------------------------
+      - name: 🖥️ Add Desktop Information
         run: |
           mkdir -p migration-live/custom_iso/root/Desktop/System-Tools
           echo "RAID automatisch aktivieren: sudo /auto_raid_setup.sh" > migration-live/custom_iso/root/Desktop/System-Tools/RAID-Check.txt
-          echo "OLVM Zertifikat importieren: update-ca-trust extract" > migration-live/custom_iso/root/Desktop/System-Tools/CA-Import.txt
+          echo "OLVM Zertifikat importieren: sudo update-ca-trust extract" > migration-live/custom_iso/root/Desktop/System-Tools/CA-Import.txt
           echo "virt-v2v Migration starten: virt-v2v -i disk /dev/sda -o qemu -os /mnt/target" > migration-live/custom_iso/root/Desktop/System-Tools/Migration.txt
+          echo "Systemsprache & Tastatur umstellen: sudo /locale_setup.sh" > migration-live/custom_iso/root/Desktop/System-Tools/Sprache.txt
 
-      - name: 🧱 Build New ISO
+      # ------------------------------------------------------------------------
+      - name: 🧱 Build Bootable ISO (UEFI + BIOS)
         run: |
           xorriso -as mkisofs -r -V "Rocky9-Live-Migration" \
             -o migration-live/rocky9-live-migration.iso \
-            -J -joliet-long -isohybrid-mbr /usr/lib/ISOLINUX/isohdpfx.bin \
-            -partition_offset 16 \
+            -J -joliet-long \
             -b isolinux/isolinux.bin -c isolinux/boot.cat \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
             -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
+            -isohybrid-gpt-basdat \
             migration-live/custom_iso
 
-      - name: 🔍 Verify ISO Bootability (QEMU Test)
+      # ------------------------------------------------------------------------
+      - name: 🧩 Verify ISO Structure
         run: |
-          qemu-system-x86_64 -m 1024 -cdrom migration-live/rocky9-live-migration.iso -boot d -display none -no-reboot -serial stdio -snapshot -device e1000 2>&1 | tee boot_test.log &
-          sleep 40
+          echo "=== Prüfe ISO-Struktur ==="
+          isoinfo -d -i migration-live/rocky9-live-migration.iso | grep -E "System id|Boot catalog"
+          ls -lh migration-live/rocky9-live-migration.iso
+
+      # ------------------------------------------------------------------------
+      - name: 🔍 Smoke-Test via QEMU
+        run: |
+          echo "=== Starte QEMU Smoke-Test ==="
+          qemu-system-x86_64 -m 1024 -cdrom migration-live/rocky9-live-migration.iso \
+            -boot d -display none -no-reboot -serial stdio -snapshot -device e1000 2>&1 | tee boot_test.log &
+          sleep 45
           grep -q "Rocky" boot_test.log && echo "✅ ISO booted successfully" || (echo "❌ Boot failed" && exit 1)
 
+      # ------------------------------------------------------------------------
       - name: 💾 Upload Artifact
         uses: actions/upload-artifact@v4
         with:
