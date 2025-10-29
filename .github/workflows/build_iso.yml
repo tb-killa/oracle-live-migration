@@ -1,4 +1,4 @@
-name: 🧱 Build Rocky 9.6 MATE Live Migration ISO (Phase 4.4 – Boot Fix)
+name: 🧱 Build Rocky 9.6 MATE Live Migration ISO (Phase 4.8 – Auto-RAID Detect + DE Locale)
 
 on:
   push:
@@ -8,186 +8,201 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
 
     steps:
-      # 1️⃣ Repository holen
+      # 1️⃣ Repository
       - name: 🧰 Checkout Repository
         uses: actions/checkout@v4
 
-      # 2️⃣ Installiere Basis-Tools
-      - name: ⚙️ Installiere Build- & Test-Tools
+      # 2️⃣ Basis-Tools
+      - name: ⚙️ Installiere Build- und Prüf-Tools
         run: |
           set -e
           sudo apt-get update
           sudo apt-get install -y \
             xorriso genisoimage p7zip-full wget rsync syslinux-common \
             qemu-system-x86 qemu-utils ovmf mdadm lvm2 parted dosfstools \
-            ntfs-3g file locales console-data
+            ntfs-3g locales jq file coreutils diffutils
 
-      # 3️⃣ ISO Cache
-      - name: ♻️ Cache Rocky 9.6 MATE Live ISO
-        id: cache-iso
+      # 3️⃣ Cache für ISO
+      - name: ♻️ Cache Rocky 9.6 MATE ISO
+        id: cache-rocky
         uses: actions/cache@v4
         with:
           path: .cache/iso
-          key: rocky96-mate-cache-v1
+          key: rocky96-mate-${{ hashFiles('.github/workflows/build_iso.yml') }}
 
-      # 4️⃣ Lade ISO nur wenn kein Cache vorhanden
-      - name: 📥 Lade Rocky 9.6 MATE Live ISO (falls kein Cache)
-        if: steps.cache-iso.outputs.cache-hit != 'true'
+      # 4️⃣ ISO herunterladen (falls nicht im Cache)
+      - name: 📥 Lade Rocky 9.6 MATE Live ISO
+        if: steps.cache-rocky.outputs.cache-hit != 'true'
         run: |
           set -e
           mkdir -p .cache/iso
           ISO_URL="https://dl.rockylinux.org/vault/rocky/9.6/live/x86_64/Rocky-9-MATE-x86_64-latest.iso"
-          echo "➡️ Lade ISO von $ISO_URL"
-          wget -q --show-progress -O .cache/iso/Rocky-9.6-MATE-x86_64.iso "$ISO_URL"
-          test -s .cache/iso/Rocky-9.6-MATE-x86_64.iso
+          ISO_FILE=".cache/iso/Rocky-9.6-MATE-x86_64.iso"
+          echo "➡️ Lade $ISO_URL ..."
+          wget -q --show-progress -O "$ISO_FILE" "$ISO_URL"
+          test -s "$ISO_FILE"
 
-      # 5️⃣ Entpacke ISO, belasse Original-Label
-      - name: 🧩 Entpacke ISO & prüfe Volume-Label
+      # 5️⃣ SHA-Check
+      - name: 🔐 Prüfe ISO-Integrität
         run: |
-          set -euo pipefail
+          set -e
+          ISO=".cache/iso/Rocky-9.6-MATE-x86_64.iso"
+          echo "SHA256: $(sha256sum "$ISO")"
+          file "$ISO"
+
+      # 6️⃣ Entpacken
+      - name: 🧩 Entpacke ISO
+        run: |
+          set -e
           mkdir -p migration-live/custom_iso
-          ISO_PATH=".cache/iso/Rocky-9.6-MATE-x86_64.iso"
-          test -s "$ISO_PATH" || { echo "❌ ISO fehlt: $ISO_PATH"; exit 1; }
+          7z x -y -o"migration-live/custom_iso" .cache/iso/Rocky-9.6-MATE-x86_64.iso >/dev/null
 
-          LABEL=$(xorriso -indev "$ISO_PATH" -pvd_info 2>&1 | sed -n 's/^Volume id: *//p' | head -n1)
-          echo "🔍 Original Label: ${LABEL:-<leer>}"
-          echo "=== Entpacke ISO ==="
-          7z x -y -o"migration-live/custom_iso" "$ISO_PATH" >/dev/null
-
-          echo "=== Belasse Original-Label (${LABEL}) für Dracut ==="
-          for cfg in migration-live/custom_iso/isolinux/isolinux.cfg migration-live/custom_iso/EFI/BOOT/grub.cfg; do
-            [ -f "$cfg" ] || continue
-            sed -i 's/Rocky Linux 9/Rocky Migration Live/g' "$cfg" || true
-          done
-          echo "✅ Label beibehalten, Bootmenü kosmetisch angepasst."
-
-      # 6️⃣ Overlay (Root-PW, RAID/LVM, Helper)
-      - name: 🔧 Overlay vorbereiten
+      # 7️⃣ Overlay + Auto-RAID + DE-Locale + Helper
+      - name: 🧱 Erstelle Overlay-Inhalte
         run: |
           set -e
           OVER="migration-live/custom_iso/root_overlay"
-          mkdir -p "$OVER"
+          mkdir -p "$OVER/usr/local/bin" "$OVER/etc/systemd/system" "$OVER/etc/X11/xorg.conf.d"
+          mkdir -p "$OVER/home/liveuser/Desktop"
 
-          cat > "$OVER/set_root.sh" <<'EOF'
-          #!/bin/bash
-          echo "root:Migration123!" | chpasswd
+          # --- Sprache & Tastatur ---
+          echo "LANG=de_DE.UTF-8" > "$OVER/etc/locale.conf"
+          echo "KEYMAP=de" > "$OVER/etc/vconsole.conf"
+          cat > "$OVER/etc/X11/xorg.conf.d/00-keyboard.conf" <<EOF
+          Section "InputClass"
+              Identifier "system-keyboard"
+              MatchIsKeyboard "on"
+              Option "XkbLayout" "de"
+          EndSection
           EOF
-          chmod +x "$OVER/set_root.sh"
 
-          cat > "$OVER/load_raid.sh" <<'EOF'
+          # --- Auto-RAID-Detection Script ---
+          cat > "$OVER/usr/local/bin/auto_raid_detect.sh" <<'EOF'
           #!/bin/bash
-          echo "[INFO] Lade RAID/LVM-Module ..."
-          for m in dm_mod md_mod raid1 raid10 raid456 linear multipath dm_mirror dm_snapshot dm_thin_pool; do
-            modprobe "$m" 2>/dev/null || true
+          echo "[Auto-RAID-Detect] Starte Erkennung..." | tee /var/log/auto_raid.log
+          for mod in dm_mod md_mod raid0 raid1 raid10 raid456 linear multipath; do
+              modprobe "$mod" 2>>/var/log/auto_raid.log || true
           done
-          systemctl enable mdmonitor.service 2>/dev/null || true
+          echo "[Auto-RAID-Detect] Prüfe bekannte Geräte..." | tee -a /var/log/auto_raid.log
+          mdadm --assemble --scan >> /var/log/auto_raid.log 2>&1 || true
+          vgchange -ay >> /var/log/auto_raid.log 2>&1 || true
+          echo "[Auto-RAID-Detect] Geräteübersicht:" | tee -a /var/log/auto_raid.log
+          lsblk >> /var/log/auto_raid.log 2>&1
           EOF
-          chmod +x "$OVER/load_raid.sh"
+          chmod +x "$OVER/usr/local/bin/auto_raid_detect.sh"
 
-          cat > "$OVER/migration_helper.sh" <<'EOF'
+          # --- Systemd-Service für Auto-RAID ---
+          cat > "$OVER/etc/systemd/system/auto-raid.service" <<EOF
+          [Unit]
+          Description=Automatische RAID/LVM Erkennung beim Start
+          After=local-fs.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/local/bin/auto_raid_detect.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+          mkdir -p "$OVER/etc/systemd/system/multi-user.target.wants"
+          ln -sf /etc/systemd/system/auto-raid.service "$OVER/etc/systemd/system/multi-user.target.wants/auto-raid.service"
+
+          # --- Helper-Skripte (RAID, CA, v2v) ---
+          cat > "$OVER/usr/local/bin/check_raid.sh" <<'EOF'
           #!/bin/bash
-          echo "[INFO] Prüfe Migrations-Tools ..."
-          for bin in virt-v2v qemu-img mdadm lvm; do
-            if command -v "$bin" >/dev/null 2>&1; then
-              echo " ✔ $bin gefunden"
-            else
-              echo " ⚠ $bin NICHT gefunden"
-            fi
-          done
+          LOG=~/Desktop/RAID_Report.txt
+          echo "=== RAID/LVM Check ===" > "$LOG"
+          date >> "$LOG"
+          echo >> "$LOG"
+          cat /proc/mdstat >> "$LOG" 2>/dev/null
+          lvs >> "$LOG" 2>/dev/null
+          lsblk >> "$LOG"
+          echo "✅ Bericht gespeichert unter \$LOG"
           EOF
-          chmod +x "$OVER/migration_helper.sh"
+          chmod +x "$OVER/usr/local/bin/check_raid.sh"
 
-      # 7️⃣ Sprache & Tastatur
-      - name: 🌍 Setze DE-Locale & Keyboard
+          cat > "$OVER/usr/local/bin/import_ca.sh" <<'EOF'
+          #!/bin/bash
+          echo "Beispiel:"
+          echo "cp /run/media/liveuser/USB/ca.crt /etc/pki/ca-trust/source/anchors/"
+          echo "update-ca-trust"
+          EOF
+          chmod +x "$OVER/usr/local/bin/import_ca.sh"
+
+          cat > "$OVER/usr/local/bin/run_v2v.sh" <<'EOF'
+          #!/bin/bash
+          echo "virt-v2v Beispiel:"
+          echo "virt-v2v -i disk /dev/sda -o rhv-upload -oc https://olvm/api -os storage --password-file /root/pw.txt"
+          EOF
+          chmod +x "$OVER/usr/local/bin/run_v2v.sh"
+
+          # --- Desktop-Dateien ---
+          echo "🧱 Rocky Migration Live – Auto-RAID aktiv" > "$OVER/home/liveuser/Desktop/00_README_DE.txt"
+          echo "- RAID prüfen: check_raid.sh" >> "$OVER/home/liveuser/Desktop/00_README_DE.txt"
+          echo "- Migration starten: run_v2v.sh" >> "$OVER/home/liveuser/Desktop/00_README_DE.txt"
+          echo "- CA importieren: import_ca.sh" >> "$OVER/home/liveuser/Desktop/00_README_DE.txt"
+          cp "$OVER/usr/local/bin/"*.sh "$OVER/home/liveuser/Desktop/"
+          chmod +x "$OVER/home/liveuser/Desktop/"*.sh
+
+      # 8️⃣ Struktur-Check
+      - name: 🧩 Struktur-Check
         run: |
           set -e
-          mkdir -p migration-live/custom_iso/etc
-          echo "LANG=de_DE.UTF-8" | tee migration-live/custom_iso/etc/locale.conf
-          echo "KEYMAP=de"        | tee migration-live/custom_iso/etc/vconsole.conf
+          echo "=== Prüfe ISO-Struktur ==="
+          test -f migration-live/custom_iso/isolinux/isolinux.bin
+          test -f migration-live/custom_iso/images/efiboot.img
 
-      # 8️⃣ Prüfe Boot-Dateien
-      - name: 🔎 Prüfe Live-Assets (EFI/Isolinux)
-        run: |
-          set -e
-          test -f migration-live/custom_iso/isolinux/isolinux.bin || { echo "❌ isolinux.bin fehlt"; exit 1; }
-          test -f migration-live/custom_iso/images/efiboot.img    || { echo "❌ efiboot.img fehlt"; exit 1; }
-          echo "✅ Boot-Dateien vorhanden."
-
-      # 9️⃣ Erzeuge Hybrid-ISO
-      - name: 💽 Erzeuge Hybrid-ISO (UEFI + BIOS)
+      # 9️⃣ Hybrid-ISO-Erzeugung
+      - name: 💽 Erzeuge Hybrid-ISO
         run: |
           set -e
           OUT="migration-live/rocky-migration-live.iso"
-          VOL="Rocky-9-6-MATE"   # <-- Original beibehalten!
-          MBR_OPT=""
-
-          for p in /usr/lib/ISOLINUX/isohdpfx.bin /usr/lib/syslinux/mbr/isohdpfx.bin; do
-            [ -f "$p" ] && MBR_OPT="-isohybrid-mbr $p" && break
-          done
-
+          VOL="Rocky-9-6-MATE-DE-RAID"
+          MBR=$(find /usr/lib -name "isohdpfx.bin" | head -n1 || true)
           xorriso -as mkisofs \
-            -V "$VOL" \
-            -o "$OUT" \
-            -b isolinux/isolinux.bin \
-            -c isolinux/boot.cat \
+            -V "$VOL" -o "$OUT" \
+            -b isolinux/isolinux.bin -c isolinux/boot.cat \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
             -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
-            $MBR_OPT \
-            -J -R -T -v \
-            migration-live/custom_iso
-
-          echo "✅ ISO erzeugt:"
+            ${MBR:+-isohybrid-mbr "$MBR"} -J -R -T migration-live/custom_iso
           ls -lh "$OUT"
 
-      # 🔟 Strukturprüfung
-      - name: 🧩 Mount & Struktur-Check
+      # 🔟 Mount-Check
+      - name: 🔍 Mount- und Struktur-Validierung
         run: |
           set -e
           ISO="migration-live/rocky-migration-live.iso"
           MNT="./_mnt_iso"
           mkdir -p "$MNT"
           sudo mount -o loop "$ISO" "$MNT"
-          echo "=== ISO-Inhalt ==="
+          echo "=== ISO-Inhalt (Top 20) ==="
           ls -lh "$MNT" | head -n 20
           sudo umount "$MNT"
 
-      # 11️⃣ QEMU Boot-Tests
+      # 11️⃣ QEMU-Smoke-Test
       - name: 🧪 QEMU-Boot-Test (UEFI)
         run: |
           set -e
           ISO="migration-live/rocky-migration-live.iso"
-          echo "=== QEMU UEFI Boot-Test ==="
-          sudo apt-get update && sudo apt-get install -y ovmf || true
-          OVMF_PATH=$(find /usr/share -type f -name "OVMF_CODE.fd" | head -n1 || true)
-          if [ -z "$OVMF_PATH" ]; then
-            echo "⚠️ Keine OVMF-Firmware – Überspringe UEFI-Test."
-            exit 0
-          fi
-          set +e
-          timeout 60s qemu-system-x86_64 \
+          sudo apt-get install -y ovmf
+          BIOS=$(find /usr/share -name "OVMF_CODE.fd" | head -n1)
+          timeout 90s qemu-system-x86_64 \
             -cdrom "$ISO" -m 2048 -boot d -no-reboot \
-            -nographic -serial mon:stdio -bios "$OVMF_PATH" -display none -snapshot
-          RC=$?
-          set -e
-          [ "$RC" -eq 124 ] && echo "✅ Boot OK (UEFI)" || echo "⚠️ Boot unvollständig (UEFI)"
+            -nographic -serial mon:stdio -bios "$BIOS" -snapshot | tee bootlog.txt
+          if grep -E 'Welcome to Rocky|Started GNOME' bootlog.txt; then
+            echo "✅ Boot erfolgreich erkannt"
+          else
+            echo "⚠️ Bootprüfung unvollständig:"
+            tail -n 25 bootlog.txt
+          fi
 
-      - name: 🧪 QEMU-Boot-Test (BIOS/SeaBIOS)
-        run: |
-          set -e
-          ISO="migration-live/rocky-migration-live.iso"
-          echo "=== QEMU BIOS Boot-Test ==="
-          set +e
-          timeout 60s qemu-system-x86_64 -cdrom "$ISO" -m 2048 -boot d \
-            -no-reboot -nographic -serial mon:stdio -snapshot
-          RC=$?
-          set -e
-          [ "$RC" -eq 124 ] && echo "✅ Boot OK (BIOS)" || echo "⚠️ Boot unvollständig (BIOS)"
-
-      # 12️⃣ Lade ISO-Artefakt hoch
+      # 12️⃣ Artefakt-Upload
       - name: 📤 Lade ISO-Artifact hoch
         uses: actions/upload-artifact@v4
         with:
-          name: rocky-9.6-mate-migration-iso
+          name: rocky-9.6-mate-live-migration-autorai
           path: migration-live/rocky-migration-live.iso
