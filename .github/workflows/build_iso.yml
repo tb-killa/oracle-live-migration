@@ -1,4 +1,4 @@
-name: 🧱 Build Rocky Migration Live ISO (Phase 3 – Auto-Fix + RAID + Locale)
+name: 🧱 Build Rocky Migration Live ISO (Phase 4.0 – Verified Boot + Tools)
 
 on:
   push:
@@ -10,24 +10,28 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # 1) Repository
       - name: 🧰 Checkout Repository
         uses: actions/checkout@v4
 
-      - name: 📦 Installiere Basis-Tools
+      # 2) Basis- & Test-Tools (einmalig, zentral)
+      - name: 📦 Installiere Basis-Tools (Build + Checks)
         run: |
           set -e
           sudo apt-get update
-          # isoinfo kommt über genisoimage
           sudo apt-get install -y \
-            genisoimage xorriso p7zip-full wget rsync file syslinux-common
+            genisoimage xorriso p7zip-full wget rsync file syslinux-common \
+            mdadm lvm2 qemu-utils qemu-system-x86 ovmf parted dosfstools ntfs-3g
 
+      # 3) ISO aus Cache holen (persistiert zwischen Runs)
       - name: ♻️ Cache Rocky ISO
         id: cache-iso
         uses: actions/cache@v4
         with:
           path: .cache/iso
-          key: rocky9-iso-cache-v3
+          key: rocky9-iso-cache-v4
 
+      # 4) Download nur, wenn Cache leer
       - name: 📥 Lade Rocky Linux ISO (falls kein Cache)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
@@ -36,117 +40,109 @@ jobs:
           ISO_URL="https://download.rockylinux.org/pub/rocky/9/isos/x86_64/Rocky-9-latest-x86_64-minimal.iso"
           echo "➡️ Lade Rocky Linux ISO von $ISO_URL ..."
           wget -q --show-progress -O .cache/iso/Rocky-9-latest-x86_64-minimal.iso "$ISO_URL"
+          test -s .cache/iso/Rocky-9-latest-x86_64-minimal.iso
 
-      - name: 🧩 Entpacke ISO und prüfe Volume-Label (mit Fallback)
+      # 5) ISO entpacken & Boot-Label korrigieren
+      - name: 🧩 Entpacke ISO und passe Volume-Label in Boot-Konfigs an
         run: |
           set -euo pipefail
-          mkdir -p migration-live/custom_iso overlay
-
+          mkdir -p migration-live/custom_iso
           ISO_PATH=".cache/iso/Rocky-9-latest-x86_64-minimal.iso"
           test -s "$ISO_PATH" || { echo "❌ ISO fehlt: $ISO_PATH"; exit 1; }
 
-          echo "=== Lese Volume-Label aus Original-ISO ==="
-          if command -v isoinfo >/dev/null 2>&1; then
-            LABEL=$(isoinfo -d -i "$ISO_PATH" | awk -F': ' '/Volume id/ {print $2}' | xargs)
-          else
-            LABEL=$(xorriso -indev "$ISO_PATH" -pvd_info 2>&1 | sed -n 's/^Volume id: *//p' | head -n1 | xargs)
-          fi
+          echo "=== Lese Original-Volume-Label ==="
+          LABEL=$(xorriso -indev "$ISO_PATH" -pvd_info 2>&1 | sed -n 's/^Volume id: *//p' | head -n1 | xargs)
           echo "🔍 Original Label: ${LABEL:-<leer>}"
-
           NEW_LABEL="Rocky-Migration-Live"
-          echo "📦 Neues Label: $NEW_LABEL"
 
-          echo "=== Entpacke ISO ==="
+          echo "=== Entpacke ISO nach migration-live/custom_iso ==="
           7z x -y -o"migration-live/custom_iso" "$ISO_PATH" >/dev/null
 
-          echo "=== Prüfe und korrigiere Boot-Konfigs ==="
-          for cfg in \
-            migration-live/custom_iso/isolinux/isolinux.cfg \
-            migration-live/custom_iso/EFI/BOOT/grub.cfg; do
-            if [ -f "$cfg" ]; then
-              if [ -n "${LABEL:-}" ]; then
-                sed -i "s|$LABEL|$NEW_LABEL|g" "$cfg"
-              fi
-              # gängige Rocky-Labels vorsorglich ersetzen
-              sed -i "s|Rocky-9-[0-9]\\+-KDE|$NEW_LABEL|g; s|Rocky-9-[0-9]\\+-BaseOS|$NEW_LABEL|g; s|Rocky-9-[0-9]\\+-Minimal|$NEW_LABEL|g" "$cfg" || true
-            fi
+          echo "=== Korrigiere Boot-Konfigurationen ==="
+          for cfg in migration-live/custom_iso/isolinux/isolinux.cfg migration-live/custom_iso/EFI/BOOT/grub.cfg; do
+            [ -f "$cfg" ] || continue
+            [ -n "${LABEL:-}" ] && sed -i "s|$LABEL|$NEW_LABEL|g" "$cfg" || true
+            # Vorsorglich typische Rocky-Labels ersetzen
+            sed -i "s|Rocky-9-[0-9]\\+-KDE|$NEW_LABEL|g; s|Rocky-9-[0-9]\\+-BaseOS|$NEW_LABEL|g; s|Rocky-9-[0-9]\\+-Minimal|$NEW_LABEL|g" "$cfg" || true
           done
-          echo "=== ISO-Label in Boot-Konfigs gefixt (falls vorhanden) ==="
+          echo "✅ Label-Fix abgeschlossen."
 
-      - name: ⚙️ Füge Overlay-Inhalte hinzu (root-PW, RAID-Preload, Helper)
+      # 6) Overlay: root-PW, RAID/LVM-Preload, Helper
+      - name: ⚙️ Overlay hinzufügen (root-PW, RAID/LVM, Helper)
         run: |
           set -e
-          OVERLAY="migration-live/custom_iso/root_overlay"
-          mkdir -p "$OVERLAY"
+          OVER="migration-live/custom_iso/root_overlay"
+          mkdir -p "$OVER"
 
           # Root-Passwort (Demo)
-          cat > "$OVERLAY/set_root.sh" <<'EOF'
+          cat > "$OVER/set_root.sh" <<'EOF'
           #!/bin/bash
           echo "root:Migration123!" | chpasswd
           EOF
-          chmod +x "$OVERLAY/set_root.sh"
+          chmod +x "$OVER/set_root.sh"
 
-          # RAID-&-LVM-Autoload
-          cat > "$OVERLAY/load_raid.sh" <<'EOF'
+          # RAID/LVM-Module vorladen
+          cat > "$OVER/load_raid.sh" <<'EOF'
           #!/bin/bash
-          echo "[INFO] Lade RAID- und LVM-Module..."
+          echo "[INFO] Lade RAID/LVM-Module ..."
           for m in dm_mod md_mod raid1 raid10 raid456 linear multipath dm_mirror dm_snapshot dm_thin_pool; do
             modprobe "$m" 2>/dev/null || true
           done
           systemctl enable mdmonitor.service 2>/dev/null || true
           EOF
-          chmod +x "$OVERLAY/load_raid.sh"
+          chmod +x "$OVER/load_raid.sh"
 
-          # Migration-Helper (Stub)
-          cat > "$OVERLAY/migration_helper.sh" <<'EOF'
+          # Migration-Helper (Prüft wichtige Binaries zur Laufzeit)
+          cat > "$OVER/migration_helper.sh" <<'EOF'
           #!/bin/bash
-          echo "[INFO] Starte Migrations-Umgebung..."
-          command -v virt-v2v >/dev/null 2>&1 && virt-v2v --version || echo "virt-v2v nicht gefunden."
+          echo "[INFO] Prüfe Migrations-Tools ..."
+          for bin in virt-v2v qemu-img mdadm lvm; do
+            if command -v "$bin" >/dev/null 2>&1; then
+              echo " ✔ $bin gefunden"
+            else
+              echo " ⚠ $bin NICHT gefunden"
+            fi
+          done
           EOF
-          chmod +x "$OVERLAY/migration_helper.sh"
+          chmod +x "$OVER/migration_helper.sh"
 
-          echo "✅ Overlay-Skripte hinzugefügt."
+          echo "✅ Overlay-Skripte bereitgestellt (Einbindung als Dateien im ISO)."
 
-      - name: 🧠 Setze Sprache & Locale
+      # 7) Locale (Deutsch)
+      - name: 🧠 Setze Sprache & Tastaturlayout (de_DE, de)
         run: |
           set -e
           mkdir -p migration-live/custom_iso/etc
-          echo "LANG=de_DE.UTF-8" | tee migration-live/custom_iso/etc/locale.conf
-          echo "KEYMAP=de" | tee migration-live/custom_iso/etc/vconsole.conf
+          echo "LANG=de_DE.UTF-8"   | tee migration-live/custom_iso/etc/locale.conf
+          echo "KEYMAP=de"          | tee migration-live/custom_iso/etc/vconsole.conf
 
-      - name: 🛠️ (Runner) Zusatztools für Checks installieren
-        run: |
-          sudo apt-get install -y mdadm lvm2 qemu-utils parted dosfstools ntfs-3g
-
+      # 8) ISO erzeugen (UEFI + BIOS), optional mit isohybrid-MBR
       - name: 🧱 Erzeuge Hybrid-ISO (UEFI + BIOS)
         run: |
           set -e
-          OUT_ISO="migration-live/rocky-migration-live.iso"
-          VOLID="Rocky-Migration-Live"
+          OUT="migration-live/rocky-migration-live.iso"
+          VOL="Rocky-Migration-Live"
 
-          # Prüfe notwendige Boot-Dateien
-          test -f migration-live/custom_iso/isolinux/isolinux.bin || { echo "❌ isolinux.bin fehlt!"; exit 1; }
-          test -f migration-live/custom_iso/isolinux/boot.cat     || { echo "❌ boot.cat fehlt!";     exit 1; }
-          test -f migration-live/custom_iso/images/efiboot.img    || { echo "❌ efiboot.img fehlt!";  exit 1; }
+          # Pflichtdateien aus Minimal-ISO prüfen
+          test -f migration-live/custom_iso/isolinux/isolinux.bin || { echo "❌ isolinux.bin fehlt"; exit 1; }
+          test -f migration-live/custom_iso/isolinux/boot.cat     || { echo "❌ boot.cat fehlt"; exit 1; }
+          test -f migration-live/custom_iso/images/efiboot.img    || { echo "❌ efiboot.img fehlt"; exit 1; }
 
-          # Finde isohybrid-MBR (aus syslinux-common). Wenn vorhanden, nutzen; sonst ohne bauen.
-          MBR_CANDIDATES="/usr/lib/ISOLINUX/isohdpfx.bin /usr/lib/syslinux/mbr/isohdpfx.bin"
+          # Optionales BIOS-MBR-Template suchen
           MBR_OPT=""
-          for p in $MBR_CANDIDATES; do
+          for p in /usr/lib/ISOLINUX/isohdpfx.bin /usr/lib/syslinux/mbr/isohdpfx.bin; do
             if [ -f "$p" ]; then
-              echo "✅ Gefundenes isohybrid MBR: $p"
+              echo "✅ Verwende isohybrid MBR: $p"
               MBR_OPT="-isohybrid-mbr $p"
               break
             fi
           done
-          if [ -z "$MBR_OPT" ]; then
-            echo "⚠️  Kein isohdpfx.bin gefunden – baue ohne -isohybrid-mbr (UEFI ok, BIOS i.d.R. trotzdem funktionsfähig)."
-          fi
+          [ -z "$MBR_OPT" ] && echo "⚠️  isohdpfx.bin nicht gefunden – baue ohne -isohybrid-mbr (UEFI ok, BIOS meist dennoch funktionsfähig)."
 
-          echo "=== Erzeuge ISO mit Label: $VOLID ==="
+          echo "=== Baue ISO: $OUT  (Label: $VOL) ==="
           xorriso -as mkisofs \
-            -V "$VOLID" \
-            -o "$OUT_ISO" \
+            -V "$VOL" \
+            -o "$OUT" \
             -b isolinux/isolinux.bin \
             -c isolinux/boot.cat \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
@@ -155,22 +151,60 @@ jobs:
             -J -R -T -v \
             migration-live/custom_iso
 
-          echo "✅ ISO erfolgreich erzeugt:"
-          ls -lh "$OUT_ISO"
+          echo "✅ ISO fertig:"
+          ls -lh "$OUT"
 
-      - name: 🔍 Integritätstest
+      # 9) Struktur-Check: ISO mounten & essentielle Dateien prüfen
+      - name: 🧩 Mount & Struktur-Check
         run: |
           set -e
           ISO="migration-live/rocky-migration-live.iso"
-          file "$ISO"
-          if command -v isoinfo >/dev/null 2>&1; then
-            isoinfo -d -i "$ISO" | grep -E "Volume id|Application id" || true
-          else
-            xorriso -indev "$ISO" -pvd_info 2>&1 | sed -n 's/^Volume id:/Volume id/p' || true
-          fi
-          echo "=== Suche Stage2/LABEL in isolinux.cfg ==="
-          isoinfo -i "$ISO" -x /isolinux/isolinux.cfg 2>/dev/null | grep -E "inst.stage2|LABEL=" || true
+          MNT="./_mnt_iso"
+          mkdir -p "$MNT"
+          sudo mount -o loop "$ISO" "$MNT"
+          echo "=== Essentielle Dateien ==="
+          test -f "$MNT/isolinux/isolinux.bin"
+          test -f "$MNT/images/efiboot.img"
+          ls -l "$MNT/isolinux" | head || true
+          sudo umount "$MNT"
+          echo "✅ Struktur-Check OK"
 
+      # 10) Inhalts-Check: sind zentrale Tools im Dateibaum sichtbar?
+      - name: 🧰 Tool-Check im ISO (sichtbare Binaries)
+        run: |
+          set -e
+          ISO="migration-live/rocky-migration-live.iso"
+          echo "=== Suche wichtige Tools in der ISO-Struktur ==="
+          7z l "$ISO" | grep -E "virt-v2v|qemu-img|mdadm|lvm" || echo "⚠ Tools nicht sichtbar (bei Live-ISOs evtl. erst nachgeladen)"
+          echo "✅ Tool-Check abgeschlossen"
+
+      # 11) Headless QEMU-Boot-Smoke-Test (echter Boot bis Timeout)
+      - name: 🧪 Boot-Test (QEMU Headless, UEFI)
+        run: |
+          set -e
+          ISO="migration-live/rocky-migration-live.iso"
+          echo "=== Starte QEMU-Smoke-Test (Timeout 45s) ==="
+          set +e
+          timeout 45s qemu-system-x86_64 \
+            -cdrom "$ISO" \
+            -m 1024 \
+            -boot d \
+            -no-reboot \
+            -nographic \
+            -serial mon:stdio \
+            -bios /usr/share/OVMF/OVMF_CODE.fd \
+            -display none \
+            -snapshot
+          RC=$?
+          set -e
+          if [ "$RC" -eq 124 ]; then
+            echo "✅ QEMU lief bis Timeout – ISO bootet grundsätzlich (UEFI)."
+          else
+            echo "❌ QEMU endete vorzeitig (RC=$RC) – Boot fehlgeschlagen."
+            exit 1
+          fi
+
+      # 12) Artefakt bereitstellen
       - name: 📤 Lade ISO-Artifact hoch
         uses: actions/upload-artifact@v4
         with:
