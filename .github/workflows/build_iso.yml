@@ -29,7 +29,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/iso
-          key: rocky9-live-mate-iso-cache-v1
+          key: rocky9.6-mate-live-cache-v1
 
       # 4) Download nur, wenn kein Cache
       - name: 📥 Lade Rocky MATE Live ISO (falls kein Cache)
@@ -37,7 +37,7 @@ jobs:
         run: |
           set -e
           mkdir -p .cache/iso
-          ISO_URL="https://download.rockylinux.org/pub/rocky/9/live/x86_64/Rocky-9-latest-x86_64-mate.iso"
+          ISO_URL="https://dl.rockylinux.org/vault/rocky/9.6/live/x86_64/Rocky-9-MATE-x86_64-latest.iso"
           echo "➡️ Lade Rocky MATE Live ISO von $ISO_URL ..."
           wget -q --show-progress -O .cache/iso/Rocky-9-latest-x86_64-mate.iso "$ISO_URL"
           test -s .cache/iso/Rocky-9-latest-x86_64-mate.iso
