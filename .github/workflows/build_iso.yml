@@ -17,9 +17,9 @@ jobs:
         run: |
           set -e
           sudo apt-get update
-          # WICHTIG: isoinfo kommt aus genisoimage; kein separates "isoinfo"-Paket installieren!
+          # isoinfo kommt über genisoimage
           sudo apt-get install -y \
-            genisoimage xorriso p7zip-full wget rsync file
+            genisoimage xorriso p7zip-full wget rsync file syslinux-common
 
       - name: ♻️ Cache Rocky ISO
         id: cache-iso
@@ -49,7 +49,6 @@ jobs:
           if command -v isoinfo >/dev/null 2>&1; then
             LABEL=$(isoinfo -d -i "$ISO_PATH" | awk -F': ' '/Volume id/ {print $2}' | xargs)
           else
-            # Fallback über xorriso
             LABEL=$(xorriso -indev "$ISO_PATH" -pvd_info 2>&1 | sed -n 's/^Volume id: *//p' | head -n1 | xargs)
           fi
           echo "🔍 Original Label: ${LABEL:-<leer>}"
@@ -68,11 +67,10 @@ jobs:
               if [ -n "${LABEL:-}" ]; then
                 sed -i "s|$LABEL|$NEW_LABEL|g" "$cfg"
               fi
-              # zusätzlich gängige Rocky-Labels ersetzen, falls Upstream variiert
-              sed -i "s|Rocky-9-[0-9]\+-KDE|$NEW_LABEL|g;s|Rocky-9-[0-9]\+-BaseOS|$NEW_LABEL|g;s|Rocky-9-[0-9]\+-Minimal|$NEW_LABEL|g" "$cfg" || true
+              # gängige Rocky-Labels vorsorglich ersetzen
+              sed -i "s|Rocky-9-[0-9]\\+-KDE|$NEW_LABEL|g; s|Rocky-9-[0-9]\\+-BaseOS|$NEW_LABEL|g; s|Rocky-9-[0-9]\\+-Minimal|$NEW_LABEL|g" "$cfg" || true
             fi
           done
-
           echo "=== ISO-Label in Boot-Konfigs gefixt (falls vorhanden) ==="
 
       - name: ⚙️ Füge Overlay-Inhalte hinzu (root-PW, RAID-Preload, Helper)
@@ -81,32 +79,25 @@ jobs:
           OVERLAY="migration-live/custom_iso/root_overlay"
           mkdir -p "$OVERLAY"
 
-          # --- Root-Passwort (Demo; in echt Secrets/Interaktiv bevorzugen) ---
+          # Root-Passwort (Demo)
           cat > "$OVERLAY/set_root.sh" <<'EOF'
           #!/bin/bash
           echo "root:Migration123!" | chpasswd
           EOF
           chmod +x "$OVERLAY/set_root.sh"
 
-          # --- RAID-&-LVM-Autoload ---
+          # RAID-&-LVM-Autoload
           cat > "$OVERLAY/load_raid.sh" <<'EOF'
           #!/bin/bash
           echo "[INFO] Lade RAID- und LVM-Module..."
-          modprobe dm_mod || true
-          modprobe md_mod || true
-          modprobe raid1 || true
-          modprobe raid10 || true
-          modprobe raid456 || true
-          modprobe linear || true
-          modprobe multipath || true
-          modprobe dm_mirror || true
-          modprobe dm_snapshot || true
-          modprobe dm_thin_pool || true
-          systemctl enable mdmonitor.service || true
+          for m in dm_mod md_mod raid1 raid10 raid456 linear multipath dm_mirror dm_snapshot dm_thin_pool; do
+            modprobe "$m" 2>/dev/null || true
+          done
+          systemctl enable mdmonitor.service 2>/dev/null || true
           EOF
           chmod +x "$OVERLAY/load_raid.sh"
 
-          # --- Migration-Helper (Stub) ---
+          # Migration-Helper (Stub)
           cat > "$OVERLAY/migration_helper.sh" <<'EOF'
           #!/bin/bash
           echo "[INFO] Starte Migrations-Umgebung..."
@@ -125,8 +116,6 @@ jobs:
 
       - name: 🛠️ (Runner) Zusatztools für Checks installieren
         run: |
-          # Diese Tools werden nur im Runner benötigt (für Tests/Prüfungen),
-          # sie landen NICHT automatisch im ISO!
           sudo apt-get install -y mdadm lvm2 qemu-utils parted dosfstools ntfs-3g
 
       - name: 🧱 Erzeuge Hybrid-ISO (UEFI + BIOS)
@@ -135,10 +124,24 @@ jobs:
           OUT_ISO="migration-live/rocky-migration-live.iso"
           VOLID="Rocky-Migration-Live"
 
-          # Fail-fast: Stelle sicher, dass Boot-Dateien vorhanden sind
+          # Prüfe notwendige Boot-Dateien
           test -f migration-live/custom_iso/isolinux/isolinux.bin || { echo "❌ isolinux.bin fehlt!"; exit 1; }
-          test -f migration-live/custom_iso/isolinux/boot.cat || { echo "❌ boot.cat fehlt!"; exit 1; }
-          test -f migration-live/custom_iso/images/efiboot.img || { echo "❌ efiboot.img fehlt!"; exit 1; }
+          test -f migration-live/custom_iso/isolinux/boot.cat     || { echo "❌ boot.cat fehlt!";     exit 1; }
+          test -f migration-live/custom_iso/images/efiboot.img    || { echo "❌ efiboot.img fehlt!";  exit 1; }
+
+          # Finde isohybrid-MBR (aus syslinux-common). Wenn vorhanden, nutzen; sonst ohne bauen.
+          MBR_CANDIDATES="/usr/lib/ISOLINUX/isohdpfx.bin /usr/lib/syslinux/mbr/isohdpfx.bin"
+          MBR_OPT=""
+          for p in $MBR_CANDIDATES; do
+            if [ -f "$p" ]; then
+              echo "✅ Gefundenes isohybrid MBR: $p"
+              MBR_OPT="-isohybrid-mbr $p"
+              break
+            fi
+          done
+          if [ -z "$MBR_OPT" ]; then
+            echo "⚠️  Kein isohdpfx.bin gefunden – baue ohne -isohybrid-mbr (UEFI ok, BIOS i.d.R. trotzdem funktionsfähig)."
+          fi
 
           echo "=== Erzeuge ISO mit Label: $VOLID ==="
           xorriso -as mkisofs \
@@ -148,7 +151,7 @@ jobs:
             -c isolinux/boot.cat \
             -no-emul-boot -boot-load-size 4 -boot-info-table \
             -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
-            -isohybrid-mbr migration-live/custom_iso/isolinux/isohdpfx.bin \
+            $MBR_OPT \
             -J -R -T -v \
             migration-live/custom_iso
 
