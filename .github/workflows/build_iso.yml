@@ -1,4 +1,4 @@
-name: 🧱 Build Rocky Linux 9.6 Live Migration ISO (Phase 4.4)
+name: 🧱 Build Rocky Linux 9.6 Live Migration ISO (Phase 4.5 Stable)
 
 on:
   push:
@@ -8,24 +8,25 @@ on:
 jobs:
   build-live-iso:
     runs-on: ubuntu-latest
+
     steps:
       # --------------------------------------------------------------
       - name: 🧰 Checkout Repository
         uses: actions/checkout@v4
 
       # --------------------------------------------------------------
-      - name: ⚙️ Install Build Tools (Ubuntu 24.04-kompatibel)
+      - name: ⚙️ Install Build Tools (Ubuntu 24.04 Fix)
         run: |
           set -e
           echo "🧩 Entferne defekte Microsoft-Repos..."
           sudo find /etc/apt/sources.list.d -type f -name "*.list" \
             -exec sudo sed -i '/packages.microsoft.com/d' {} \; || true
           sudo sed -i '/packages.microsoft.com/d' /etc/apt/sources.list || true
-          echo "📦 Aktualisiere Paketquellen..."
+          echo "📦 Update Paketquellen..."
           sudo apt-get update -y
-          echo "🔧 Installiere benötigte Tools..."
+          echo "🔧 Installiere Tools..."
           sudo apt-get install -y p7zip-full xorriso genisoimage syslinux-utils wget jq
-          echo "✅ Build-Tools bereit."
+          echo "✅ Tools bereit."
 
       # --------------------------------------------------------------
       - name: 💾 Restore ISO Cache
@@ -33,20 +34,20 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .cache/iso
-          key: rocky9-mate-live-iso-v4
+          key: rocky9-mate-live-iso-v5
 
       # --------------------------------------------------------------
-      - name: 📦 Download Rocky 9.6 MATE Live ISO (if not cached)
+      - name: 📦 Download Rocky 9.6 MATE ISO (if not cached)
         if: steps.cache-iso.outputs.cache-hit != 'true'
         run: |
           set -e
           mkdir -p .cache/iso
           cd .cache/iso
-          echo "📥 Lade Rocky 9.6 MATE Live-ISO..."
+          echo "📥 Lade Rocky 9.6 MATE ISO..."
           wget -q --show-progress \
             https://dl.rockylinux.org/vault/rocky/9.6/live/x86_64/Rocky-9-MATE-x86_64-latest.iso \
             -O Rocky-9-MATE-x86_64-latest.iso
-          echo "✅ Download abgeschlossen"
+          echo "✅ Download abgeschlossen."
           ls -lh
 
       # --------------------------------------------------------------
@@ -54,17 +55,17 @@ jobs:
         run: |
           set -e
           mkdir -p migration-live/custom_iso
-          7z x .cache/iso/Rocky-9-MATE-x86_64-latest.iso \
-             -o"migration-live/custom_iso" -y
-          echo "=== Beispielhafte Inhalte ==="
+          7z x .cache/iso/Rocky-9-MATE-x86_64-latest.iso -o"migration-live/custom_iso" -y
+          echo "=== ISO-Inhalt (Top 15) ==="
           ls -lh migration-live/custom_iso | head -n 15
 
       # --------------------------------------------------------------
       - name: 🔧 Integrate RAID + Migration Tools
         run: |
+          set -e
           cat << 'EOF' > migration-live/custom_iso/auto_raid_setup.sh
           #!/bin/bash
-          echo "🔧 Initialisiere RAID- und Migrationstools..." | tee /var/log/livecheck.log
+          echo "🔧 Initialisiere RAID / Migrationstools..." | tee /var/log/livecheck.log
           dnf install -y kernel-modules-extra mdadm dmraid lvm2 virt-v2v virt-install virt-manager \
               --setopt=install_weak_deps=False --skip-broken
           for mod in isci dm_mod md_mod raid0 raid1 raid10 raid456 multipath; do
@@ -81,9 +82,10 @@ jobs:
       # --------------------------------------------------------------
       - name: 🌍 Set Locale & Keyboard (DE)
         run: |
+          set -e
           cat << 'EOF' > migration-live/custom_iso/locale_setup.sh
           #!/bin/bash
-          echo "🌍 Setze Sprache & Tastatur auf Deutsch..." | tee -a /var/log/livecheck.log
+          echo "🌍 Sprache & Tastatur → Deutsch" | tee -a /var/log/livecheck.log
           localectl set-locale LANG=de_DE.UTF-8
           localectl set-keymap de
           timedatectl set-timezone Europe/Berlin
@@ -91,22 +93,24 @@ jobs:
           chmod +x migration-live/custom_iso/locale_setup.sh
 
       # --------------------------------------------------------------
-      - name: 🖥️ Add Desktop Info Files
+      - name: 🖥️ Add Desktop Info
         run: |
+          set -e
           mkdir -p migration-live/custom_iso/root/Desktop/System-Tools
           echo "RAID aktivieren:\n  sudo /auto_raid_setup.sh" \
             > migration-live/custom_iso/root/Desktop/System-Tools/RAID-Check.txt
           echo "OLVM-Zertifikat importieren:\n  sudo update-ca-trust extract" \
             > migration-live/custom_iso/root/Desktop/System-Tools/CA-Import.txt
-          echo "Virt-V2V-Migration starten:\n  virt-v2v -i disk /dev/sda -o qemu -os /mnt/target" \
+          echo "Virt-V2V-Migration:\n  virt-v2v -i disk /dev/sda -o qemu -os /mnt/target" \
             > migration-live/custom_iso/root/Desktop/System-Tools/Migration.txt
-          echo "Sprache & Tastatur umstellen:\n  sudo /locale_setup.sh" \
+          echo "Sprache → Deutsch:\n  sudo /locale_setup.sh" \
             > migration-live/custom_iso/root/Desktop/System-Tools/Sprache.txt
 
       # --------------------------------------------------------------
       - name: 🧱 Build Bootable ISO (UEFI + BIOS)
         run: |
           set -e
+          echo "=== Baue Hybrid-ISO ==="
           xorriso -as mkisofs -r -V "Rocky9-Live-Migration" \
             -o migration-live/rocky9-live-migration.iso \
             -J -joliet-long \
@@ -115,23 +119,31 @@ jobs:
             -eltorito-alt-boot -e images/efiboot.img -no-emul-boot \
             -isohybrid-gpt-basdat \
             migration-live/custom_iso
+          echo "✅ ISO fertig."
 
       # --------------------------------------------------------------
-      - name: 🔍 Validate Bootstruktur (xorriso Safe)
+      - name: 🔍 Validate Bootstruktur (Safe)
         run: |
           set -e
-          echo "=== Prüfe ISO-Bootstruktur ==="
-          xorriso -indev migration-live/rocky9-live-migration.iso -report_el_torito plain \
-            | grep -E "boot image|Platform Id|System area summary"
-          echo "=== Test-Mount (Lesbarkeit) ==="
+          echo "=== Prüfe Bootstruktur ===" 
+          BOOTINFO=$(xorriso -indev migration-live/rocky9-live-migration.iso \
+                      -report_el_torito plain | grep -E "boot image|Platform Id|System area summary" || true)
+          echo "$BOOTINFO"
+          if echo "$BOOTINFO" | grep -qi "boot image"; then
+            echo "✅ Bootstruktur erkannt."
+          else
+            echo "❌ Kein Boot-Record gefunden!"
+            exit 2
+          fi
+          echo "=== Test-Mount ==="
           mkdir -p /tmp/testiso
           sudo mount -o loop migration-live/rocky9-live-migration.iso /tmp/testiso
           ls /tmp/testiso | head
           sudo umount /tmp/testiso
-          echo "✅ ISO erfolgreich geprüft."
+          echo "✅ ISO prüfung ok."
 
       # --------------------------------------------------------------
-      - name: 💾 Upload Build Artifact
+      - name: 💾 Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: rocky9-live-migration.iso
